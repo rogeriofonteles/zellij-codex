@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Send one Codex agent status report to the Zellij plugin."""
+
+import argparse
+import json
+import subprocess
+import os
+from pathlib import Path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("status", choices=("running", "idle", "input", "stuck", "error", "done", "paused"))
+    parser.add_argument("--agent", default="codex")
+    parser.add_argument("--id", default=os.environ.get("CODEX_THREAD_ID") or f"pane-{os.environ.get('ZELLIJ_PANE_ID', 'manual')}")
+    parser.add_argument("--task", default="")
+    parser.add_argument("--worktree", default=Path.cwd().name)
+    parser.add_argument(
+        "--plugin",
+        default=str(Path(__file__).resolve().parents[1] / "target/wasm32-wasip1/release/zellij-codex.wasm"),
+    )
+    args = parser.parse_args()
+
+    payload = json.dumps(
+        {
+            "id": args.id,
+            "agent": args.agent,
+            "status": args.status,
+            "task": args.task,
+            "worktree": args.worktree,
+            "pane_id": int(os.environ["ZELLIJ_PANE_ID"]) if os.environ.get("ZELLIJ_PANE_ID", "").isdigit() else None,
+        },
+        separators=(",", ":"),
+    )
+    subprocess.run(
+        ["zellij", "pipe", "--plugin", f"file:{args.plugin}", "--name", "codex_status", "--", payload],
+        check=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

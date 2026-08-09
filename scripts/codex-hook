@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Translate a Codex lifecycle hook on stdin into a Zellij agent report."""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def status_for(event: str) -> str:
+    return {
+        "SessionStart": "idle",
+        "UserPromptSubmit": "running",
+        "PermissionRequest": "input",
+        "Stop": "idle",
+        "SessionEnd": "done",
+    }.get(event, "running")
+
+
+def task_for(event: str, payload: dict) -> str:
+    if event == "UserPromptSubmit":
+        return str(payload.get("prompt", ""))
+    if event == "PermissionRequest":
+        return f"Approval needed: {payload.get('tool_name', 'tool')}"
+    if event == "Stop":
+        return str(payload.get("last_assistant_message") or "Waiting for input")
+    if event == "SessionEnd":
+        return f"Session ended: {payload.get('reason', 'unknown')}"
+    return "New Codex conversation"
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+        event = str(payload["hook_event_name"])
+        session_id = str(payload["session_id"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return 0
+
+    # Hooks outside Zellij must never launch or update a dashboard in an
+    # unrelated session.
+    if not os.environ.get("ZELLIJ_SESSION_NAME"):
+        return 0
+
+    cwd = Path(str(payload.get("cwd") or os.getcwd()))
+    pane = os.environ.get("ZELLIJ_PANE_ID", "")
+    zellij_session = os.environ.get("ZELLIJ_SESSION_NAME", "")
+    report = {
+        # The pane identity is available before Codex creates a session. This
+        # lets a launch report and later lifecycle hooks update the same row.
+        "id": f"{zellij_session}:pane:{pane}" if pane else session_id,
+        "agent": f"codex-{pane}" if pane else f"codex-{session_id[:8]}",
+        "status": status_for(event),
+        "task": task_for(event, payload),
+        "worktree": cwd.name,
+        "pane_id": int(pane) if pane.isdigit() else None,
+        "remove": event == "SessionEnd",
+    }
+    plugin = os.environ.get("ZELLIJ_CODEX_PLUGIN") or str(
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        / "zellij/plugins/zellij-codex.wasm"
+    )
+    try:
+        subprocess.run(
+            [
+                "zellij",
+                "pipe",
+                "--plugin",
+                f"file:{plugin}",
+                "--name",
+                "codex_status",
+                "--",
+                json.dumps(report, separators=(",", ":")),
+            ],
+            check=False,
+            timeout=2,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
