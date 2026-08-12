@@ -60,6 +60,62 @@ worktree tab. This keeps a single plugin instance available across tabs.
 Press `Esc` while the dashboard is focused to hide it; press `Alt a` to show it
 again.
 
+## Report Codex sessions running over SSH
+
+Remote Codex hooks cannot use the local Zellij pipe directly. An authenticated
+loopback receiver plus an SSH reverse tunnel bridges them without exposing a
+public listening port.
+
+On the local workstation, rerun `./scripts/install`, then start the receiver:
+
+```sh
+zellij-codex-receiver --session workbench-v2-agent
+```
+
+Leave it running (a dedicated terminal or a user service is fine). It listens
+only on `127.0.0.1:47832` and reads its token from
+`~/.config/zellij-codex/relay-token`.
+
+Connect to the remote machine with a reverse tunnel:
+
+```sh
+ssh -R 127.0.0.1:47832:127.0.0.1:47832 your-server
+```
+
+The first address is remote; the second is the receiver on this workstation.
+Add this to the remote host's entry in local `~/.ssh/config` to make the tunnel
+automatic:
+
+```sshconfig
+Host your-server
+    RemoteForward 127.0.0.1:47832 127.0.0.1:47832
+    ExitOnForwardFailure yes
+```
+
+Copy this repository (or just the `scripts/remote-hook` and
+`scripts/install-remote` files) to the remote machine. On the workstation,
+print the secret once:
+
+```sh
+cat ~/.config/zellij-codex/relay-token
+```
+
+Then, in the repository checkout on the remote machine, install the hook using
+that value:
+
+```sh
+./scripts/install-remote --host your-server
+```
+
+Paste the token at its hidden prompt. Avoid passing `--token` unless necessary,
+because command-line values can remain in shell history.
+
+The token is stored with mode `0600` in
+`~/.config/zellij-codex/remote.json`. Start a new remote Codex process and
+approve the hooks when prompted. Its rows will appear in the local floating
+panel with agent names such as `your-server:codex`. Reports are best-effort:
+Codex continues normally if the tunnel or local Zellij session is unavailable.
+
 For manual testing, send a status report using the same installed plugin URL:
 
 ```sh

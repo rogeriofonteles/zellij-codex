@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Translate a remote Codex lifecycle hook and send it to the local relay."""
+
+import json
+import os
+import socket
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def status_for(event: str) -> str:
+    return {
+        "SessionStart": "idle",
+        "UserPromptSubmit": "running",
+        "PermissionRequest": "input",
+        "Stop": "idle",
+        "SessionEnd": "done",
+    }.get(event, "running")
+
+
+def task_for(event: str, payload: dict) -> str:
+    if event == "UserPromptSubmit":
+        return str(payload.get("prompt", ""))
+    if event == "PermissionRequest":
+        return f"Approval needed: {payload.get('tool_name', 'tool')}"
+    if event == "Stop":
+        return str(payload.get("last_assistant_message") or "Waiting for input")
+    if event == "SessionEnd":
+        return f"Session ended: {payload.get('reason', 'unknown')}"
+    return "New remote Codex conversation"
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+        event = str(payload["hook_event_name"])
+        session_id = str(payload["session_id"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return 0
+
+    config_path = Path(
+        os.environ.get(
+            "ZELLIJ_CODEX_REMOTE_CONFIG",
+            Path.home() / ".config/zellij-codex/remote.json",
+        )
+    )
+    try:
+        config = json.loads(config_path.read_text())
+        url = str(config.get("url") or "http://127.0.0.1:47832/report")
+        token = str(config["token"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return 0
+
+    host = str(config.get("host") or socket.gethostname().split(".")[0])
+    cwd = Path(str(payload.get("cwd") or os.getcwd()))
+    report = {
+        "id": f"remote:{host}:{session_id}",
+        "agent": f"{host}:codex",
+        "status": status_for(event),
+        "task": task_for(event, payload),
+        "worktree": cwd.name,
+        "pane_id": None,
+        "remove": event == "SessionEnd",
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(report, separators=(",", ":")).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=2).close()
+    except (OSError, urllib.error.URLError):
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

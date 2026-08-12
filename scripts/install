@@ -3,6 +3,7 @@
 
 import json
 import os
+import secrets
 import shutil
 from pathlib import Path
 
@@ -20,6 +21,8 @@ def main() -> None:
     plugin = config_home / "zellij/plugins/zellij-codex.wasm"
     hook = Path.home() / ".local/bin/zellij-codex-hook"
     launcher = Path.home() / ".local/bin/zellij-codex-launch"
+    receiver = Path.home() / ".local/bin/zellij-codex-receiver"
+    relay_token = config_home / "zellij-codex/relay-token"
     fish_function = config_home / "fish/functions/codex.fish"
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
     hooks_json = codex_home / "hooks.json"
@@ -30,8 +33,14 @@ def main() -> None:
     shutil.copy2(source_wasm, plugin)
     shutil.copy2(root / "scripts/codex-hook", hook)
     shutil.copy2(root / "scripts/codex-launch", launcher)
+    shutil.copy2(root / "scripts/remote-receiver", receiver)
     hook.chmod(0o755)
     launcher.chmod(0o755)
+    receiver.chmod(0o755)
+    relay_token.parent.mkdir(parents=True, exist_ok=True)
+    if not relay_token.exists():
+        relay_token.write_text(secrets.token_urlsafe(32) + "\n")
+        relay_token.chmod(0o600)
 
     # Zellij panes in this setup use fish. A function preserves the normal
     # `codex` command while adding a report before the Codex TUI starts.
@@ -61,6 +70,8 @@ def main() -> None:
     print(f"plugin: {plugin}")
     print(f"hook reporter: {hook}")
     print(f"launch reporter: {launcher}")
+    print(f"remote receiver: {receiver}")
+    print(f"remote relay token: {relay_token}")
     print(f"fish integration: {fish_function}")
     print(f"Codex hooks: {hooks_json}")
     print("Open a new Codex instance and run /hooks once to review and enable the hooks.")
