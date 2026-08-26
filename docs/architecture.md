@@ -8,12 +8,19 @@ scripts/report-status
   -> Zellij WASM plugin pipe() callback
   -> validate + replace one in-memory AgentReport
   -> ANSI-colored row
+
+Zellij PaneUpdate
+  -> inspect each terminal's live command and cwd
+  -> add Codex panes that have not reported through a hook
+  -> replace the discovered row by pane ID when a hook report arrives
 ```
 
 Zellij's pipe transport is the smallest native boundary: it is session-local,
 does not require a daemon or filesystem polling, and can target a particular
-plugin URL. Later, the report envelope should gain a schema version, Zellij
-session, stable agent ID, pane ID, tab ID, timestamp, and sequence number.
+plugin URL. Pane discovery complements the transport for processes launched by
+layouts or other tools. Pane IDs de-duplicate both sources within a Zellij
+session. Later, the report envelope should gain a schema version, Zellij
+session, stable agent ID, tab ID, timestamp, and sequence number.
 
 ## Codex 0.147.0 findings
 
