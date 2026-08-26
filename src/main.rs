@@ -1,10 +1,13 @@
-//! Zellij plugin entry point and the first one-agent vertical slice.
+//! Zellij plugin entry point for the Codex status dashboard.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
 const PIPE_NAME: &str = "codex_status";
+const SHOW_DASHBOARD_PIPE_NAME: &str = "show_dashboard";
+const DASHBOARD_PANE_TITLE: &str = "Codex Dashboard";
+const NEOVIM_PANE_TITLE: &str = "Neovim";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -74,6 +77,22 @@ struct AgentReport {
 struct App {
     agents: BTreeMap<String, AgentReport>,
     error: Option<String>,
+    pane_manifest: PaneManifest,
+    tabs: Vec<TabInfo>,
+    suppressed_neovim: Option<SuppressedNeovim>,
+    pending_neovim_suppression: Option<PendingNeovimSuppression>,
+}
+
+#[derive(Clone, Copy)]
+struct SuppressedNeovim {
+    pane_id: PaneId,
+    tab_id: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingNeovimSuppression {
+    tab_position: usize,
+    tab_id: Option<usize>,
 }
 
 register_plugin!(App);
@@ -86,23 +105,172 @@ impl App {
             self.agents.insert(agent.id.clone(), agent);
         }
     }
+
+    fn show_dashboard(&mut self) {
+        let Ok((tab_position, _)) = get_focused_pane_info() else {
+            self.error = Some("could not determine the focused Zellij pane".to_string());
+            show_self(true);
+            self.center_dashboard();
+            return;
+        };
+
+        self.error = None;
+        self.suppressed_neovim = None;
+        self.pending_neovim_suppression = None;
+        let tab_id = self.tab_id_at_position(tab_position);
+        let should_suppress_neovim = !self.floating_panes_are_visible(tab_position);
+        let neovim_to_suppress = should_suppress_neovim
+            .then(|| self.neovim_pane_id(tab_position))
+            .flatten();
+        if should_suppress_neovim && neovim_to_suppress.is_none() {
+            self.pending_neovim_suppression = Some(PendingNeovimSuppression {
+                tab_position,
+                tab_id,
+            });
+        }
+
+        if self.move_to_tab(tab_position) {
+            hide_self();
+        }
+        rename_plugin_pane(get_plugin_ids().plugin_id, DASHBOARD_PANE_TITLE);
+        show_self(true);
+        if let Some(neovim_pane_id) = neovim_to_suppress {
+            self.suppress_neovim(neovim_pane_id, tab_id);
+        }
+        self.center_dashboard();
+    }
+
+    fn hide_dashboard(&mut self) {
+        self.pending_neovim_suppression = None;
+        hide_self();
+        if let Some(neovim) = self.suppressed_neovim.take() {
+            show_pane_with_id(neovim.pane_id, true, false);
+            if let Err(error) = hide_floating_panes(neovim.tab_id) {
+                self.error = Some(format!("could not restore the workbench view: {error}"));
+            }
+        }
+    }
+
+    fn center_dashboard(&self) {
+        let plugin_id = PaneId::Plugin(get_plugin_ids().plugin_id);
+        let coordinates = FloatingPaneCoordinates::default()
+            .with_x_percent(25)
+            .with_y_percent(25)
+            .with_width_percent(50)
+            .with_height_percent(50);
+        change_floating_panes_coordinates(vec![(plugin_id, coordinates)]);
+    }
+
+    fn move_to_tab(&self, tab_position: usize) -> bool {
+        let plugin_id = get_plugin_ids().plugin_id;
+        if self.plugin_tab_position(plugin_id) != Some(tab_position) {
+            break_panes_to_tab_with_index(&[PaneId::Plugin(plugin_id)], tab_position, false);
+            return true;
+        }
+        false
+    }
+
+    fn tab_id_at_position(&self, tab_position: usize) -> Option<usize> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.position == tab_position)
+            .map(|tab| tab.tab_id)
+    }
+
+    fn floating_panes_are_visible(&self, tab_position: usize) -> bool {
+        let cached_visibility = self
+            .tabs
+            .iter()
+            .find(|tab| tab.position == tab_position)
+            .is_some_and(|tab| tab.are_floating_panes_visible);
+        self.tab_id_at_position(tab_position)
+            .and_then(get_tab_info)
+            .map_or(cached_visibility, |tab| tab.are_floating_panes_visible)
+    }
+
+    fn neovim_pane_id(&self, tab_position: usize) -> Option<PaneId> {
+        let pane_id = self
+            .pane_manifest
+            .panes
+            .get(&tab_position)?
+            .iter()
+            .find(|pane| {
+                !pane.is_plugin
+                    && pane.is_floating
+                    && !pane.is_suppressed
+                    && pane.title == NEOVIM_PANE_TITLE
+            })
+            .map(|pane| PaneId::Terminal(pane.id))?;
+        get_pane_info(pane_id)
+            .filter(|pane| {
+                !pane.is_plugin
+                    && pane.is_floating
+                    && !pane.is_suppressed
+                    && pane.title == NEOVIM_PANE_TITLE
+            })
+            .map(|_| pane_id)
+    }
+
+    fn plugin_tab_position(&self, plugin_id: u32) -> Option<usize> {
+        self.pane_manifest
+            .panes
+            .iter()
+            .find(|(_, panes)| {
+                panes
+                    .iter()
+                    .any(|pane| pane.is_plugin && pane.id == plugin_id)
+            })
+            .map(|(tab_position, _)| *tab_position)
+    }
+
+    fn update_pane_manifest(&mut self, pane_manifest: PaneManifest) {
+        self.pane_manifest = pane_manifest;
+        let Some(pending) = self.pending_neovim_suppression else {
+            return;
+        };
+        let Some(neovim_pane_id) = self.neovim_pane_id(pending.tab_position) else {
+            return;
+        };
+
+        self.pending_neovim_suppression = None;
+        self.suppress_neovim(neovim_pane_id, pending.tab_id);
+    }
+
+    fn suppress_neovim(&mut self, pane_id: PaneId, tab_id: Option<usize>) {
+        hide_pane_with_id(pane_id);
+        self.suppressed_neovim = Some(SuppressedNeovim { pane_id, tab_id });
+    }
 }
 
 impl ZellijPlugin for App {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
-        subscribe(&[EventType::Key]);
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+            PermissionType::ReadCliPipes,
+        ]);
+        subscribe(&[EventType::Key, EventType::PaneUpdate, EventType::TabUpdate]);
     }
 
     fn update(&mut self, event: Event) -> bool {
-        if let Event::Key(key) = event {
-            if key.bare_key == BareKey::Esc && key.key_modifiers.is_empty() {
-                hide_self();
+        match event {
+            Event::Key(key) if key.bare_key == BareKey::Esc && key.key_modifiers.is_empty() => {
+                self.hide_dashboard();
             }
+            Event::PaneUpdate(pane_manifest) => self.update_pane_manifest(pane_manifest),
+            Event::TabUpdate(tabs) => self.tabs = tabs,
+            _ => {}
         }
         false
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
+        if message.name == SHOW_DASHBOARD_PIPE_NAME {
+            self.show_dashboard();
+            #[cfg(target_family = "wasm")]
+            unblock_cli_pipe_input(&message.name);
+            return true;
+        }
         if message.name != PIPE_NAME {
             return false;
         }

@@ -46,19 +46,19 @@ To access it directly with `Alt a`, add this binding inside the
 
 ```kdl
 bind "Alt a" {
-    LaunchOrFocusPlugin "file:/absolute/path/to/zellij/plugins/zellij-codex.wasm" {
-        floating true
-        move_to_focused_tab true
+    MessagePlugin "file:/absolute/path/to/zellij/plugins/zellij-codex.wasm" {
+        name "show_dashboard"
+        floating false
     }
 }
 ```
 
-The binding applies to new Zellij sessions after the configuration is loaded.
 Use an absolute path in the plugin URL; KDL does not expand shell variables.
-The action opens or focuses one floating dashboard and moves it to the active
-worktree tab. This keeps a single plugin instance available across tabs.
-Press `Esc` while the dashboard is focused to hide it; press `Alt a` to show it
-again.
+The action asks the background plugin to open a centered floating dashboard in
+the active worktree tab. If the Git/Codex view is active, its hidden Neovim
+overlay stays hidden. If Neovim is active, the dashboard appears over it.
+Press `Esc` while the dashboard is focused to restore the previous view; press
+`Alt a` to show it again.
 
 ## Report Codex sessions running over SSH
 
@@ -166,10 +166,10 @@ Implemented now:
 - colored terminal rendering;
 - automatic SessionStart, UserPromptSubmit, PermissionRequest, Stop, and
   SessionEnd lifecycle reporting through `zellij pipe`;
+- pane and tab discovery for a workbench-aware floating overlay;
 - a manual producer for testing.
 
 Deliberately deferred until this transport is proven inside Zellij:
 
-- pane/tab discovery and aggregation;
 - persistence, expiry/heartbeat semantics, and navigation;
 - tab-bar integration.
