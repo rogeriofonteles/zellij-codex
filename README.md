@@ -37,10 +37,16 @@ when its Codex pane is focused or visible in the active Git/Codex view. A
 full-screen Neovim overlay keeps the result unread until that view is closed.
 Each lifecycle report includes its stable Zellij tab identity, so visiting one
 workbench does not acknowledge completed results from any other workbench.
+Closing a Codex pane removes its row from the dashboard even when Codex exits
+before its `SessionEnd` hook can report the closure.
 
 Start Codex once after installation. Codex will show a **Hooks need review**
 screen; choose **Trust all and continue** after reviewing the command. New
 Codex conversations opened inside Zellij will then register automatically.
+When the launcher runs in a linked Git worktree, it enables the reviewed hooks
+for that invocation only if the repository's main worktree is explicitly
+trusted. It does not edit Codex's global configuration or extend trust to
+unrelated repositories.
 
 Launch the dashboard as a floating pane from inside a Zellij session:
 
@@ -174,7 +180,7 @@ Implemented now:
 - colored terminal rendering;
 - automatic SessionStart, UserPromptSubmit, PermissionRequest, Stop, and
   SessionEnd lifecycle reporting through `zellij pipe`;
-- discovery of workbench-launched Codex panes and unread results;
+- discovery and removal of workbench-launched Codex panes and unread results;
 - pane and tab tracking for a workbench-aware floating overlay;
 - a manual producer for testing.
 

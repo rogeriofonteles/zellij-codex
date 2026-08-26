@@ -6,13 +6,15 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import tomllib
 from pathlib import Path
 
 
 def pane_context(cwd: Path) -> tuple[str, int | None, int | None]:
     panes = _list_panes()
-    pane = os.environ.get("ZELLIJ_CODEX_PANE_ID") or os.environ.get(
-        "ZELLIJ_PANE_ID", ""
+    pane = os.environ.get("ZELLIJ_PANE_ID") or os.environ.get(
+        "ZELLIJ_CODEX_PANE_ID", ""
     )
     if pane.isdigit():
         tab_id, tab_position = _pane_location(panes, int(pane))
@@ -56,6 +58,47 @@ def configure_pane_identity(
         os.environ["ZELLIJ_CODEX_TAB_ID"] = str(tab_id)
     if tab_position is not None:
         os.environ["ZELLIJ_CODEX_TAB_POSITION"] = str(tab_position)
+
+
+def codex_arguments(args: list[str], cwd: Path) -> list[str]:
+    trust_override = _linked_worktree_trust_override(cwd)
+    if trust_override is None:
+        return args
+    return ["--config", trust_override, *args]
+
+
+def restore_zellij_socket_dir() -> str | None:
+    socket_dir = os.environ.get("ZELLIJ_SOCKET_DIR")
+    if socket_dir:
+        return socket_dir
+
+    session = os.environ.get("ZELLIJ_SESSION_NAME")
+    if not session:
+        return None
+
+    for candidate in _zellij_socket_dir_candidates():
+        try:
+            contract_dirs = candidate.glob("contract_version_*")
+            if not any(
+                (contract_dir / session).exists() for contract_dir in contract_dirs
+            ):
+                continue
+        except OSError:
+            continue
+        socket_dir = str(candidate)
+        os.environ["ZELLIJ_SOCKET_DIR"] = socket_dir
+        return socket_dir
+    return None
+
+
+def _zellij_socket_dir_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        candidates.append(Path(runtime_dir) / "zellij")
+    if hasattr(os, "getuid"):
+        candidates.append(Path(tempfile.gettempdir()) / f"zellij-{os.getuid()}")
+    return list(dict.fromkeys(candidates))
 
 
 def _list_panes() -> list[dict[str, object]]:
@@ -110,6 +153,77 @@ def _command_contains_launcher(command: object) -> bool:
     )
 
 
+def _linked_worktree_trust_override(cwd: Path) -> str | None:
+    worktrees = _git_worktrees(cwd)
+    if len(worktrees) < 2:
+        return None
+
+    resolved_cwd = cwd.resolve()
+    current = next(
+        (
+            worktree
+            for worktree in worktrees
+            if resolved_cwd == worktree or worktree in resolved_cwd.parents
+        ),
+        None,
+    )
+    primary = worktrees[0]
+    if current is None or current == primary:
+        return None
+
+    projects = _codex_projects()
+    if _project_is_trusted(projects, current) or not _project_is_trusted(
+        projects, primary
+    ):
+        return None
+
+    project_key = json.dumps(str(current))
+    return f'projects.{project_key}.trust_level="trusted"'
+
+
+def _git_worktrees(cwd: Path) -> list[Path]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "worktree", "list", "--porcelain"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    return [
+        Path(line.removeprefix("worktree ")).resolve()
+        for line in result.stdout.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
+def _codex_projects() -> dict[str, object]:
+    config_root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    try:
+        with (config_root / "config.toml").open("rb") as config_file:
+            projects = tomllib.load(config_file).get("projects", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    if not isinstance(projects, dict):
+        return {}
+    return projects
+
+
+def _project_is_trusted(projects: dict[str, object], path: Path) -> bool:
+    for project_path, settings in projects.items():
+        if (
+            isinstance(settings, dict)
+            and settings.get("trust_level") == "trusted"
+            and Path(project_path).resolve() == path
+        ):
+            return True
+    return False
+
+
 def report_launch(pane: str, tab_id: int | None, tab_position: int | None) -> None:
     if not pane:
         return
@@ -150,13 +264,15 @@ def report_launch(pane: str, tab_id: int | None, tab_position: int | None) -> No
 
 
 def main() -> None:
-    pane, tab_id, tab_position = pane_context(Path.cwd())
+    restore_zellij_socket_dir()
+    cwd = Path.cwd()
+    pane, tab_id, tab_position = pane_context(cwd)
     configure_pane_identity(pane, tab_id, tab_position)
     report_launch(pane, tab_id, tab_position)
     executable = shutil.which("codex")
     if not executable:
         raise SystemExit("codex executable not found")
-    os.execv(executable, ["codex", *sys.argv[1:]])
+    os.execv(executable, ["codex", *codex_arguments(sys.argv[1:], cwd)])
 
 
 if __name__ == "__main__":

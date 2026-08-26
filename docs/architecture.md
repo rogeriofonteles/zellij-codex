@@ -12,6 +12,7 @@ scripts/report-status
 Zellij PaneUpdate
   -> discover live Codex terminal panes
   -> reconcile discovered rows with lifecycle reports by pane ID
+  -> remove pane-backed rows whose terminal pane no longer exists
   -> map each result to its stable Zellij tab identity
   -> clear only results in the active, visibly tiled Git/Codex view
 ```

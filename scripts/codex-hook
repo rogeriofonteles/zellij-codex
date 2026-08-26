@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -30,46 +31,120 @@ def task_for(event: str, payload: dict) -> str:
     return "New Codex conversation"
 
 
-def pane_context(cwd: Path) -> tuple[str, int | None, int | None]:
-    panes = _list_panes()
+def restore_zellij_socket_dir() -> str | None:
+    socket_dir = os.environ.get("ZELLIJ_SOCKET_DIR")
+    if socket_dir:
+        return socket_dir
+
+    session = os.environ.get("ZELLIJ_SESSION_NAME")
+    if not session:
+        return None
+
+    for candidate in _zellij_socket_dir_candidates():
+        try:
+            contract_dirs = candidate.glob("contract_version_*")
+            if not any(
+                (contract_dir / session).exists() for contract_dir in contract_dirs
+            ):
+                continue
+        except OSError:
+            continue
+        socket_dir = str(candidate)
+        os.environ["ZELLIJ_SOCKET_DIR"] = socket_dir
+        return socket_dir
+    return None
+
+
+def _zellij_socket_dir_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        candidates.append(Path(runtime_dir) / "zellij")
+    if hasattr(os, "getuid"):
+        candidates.append(Path(tempfile.gettempdir()) / f"zellij-{os.getuid()}")
+    return list(dict.fromkeys(candidates))
+
+
+def pane_context(cwd: Path) -> tuple[str, str, int | None, int | None]:
+    requested_session = os.environ.get("ZELLIJ_SESSION_NAME", "")
+    session_panes = (
+        [(requested_session, _list_panes(requested_session))]
+        if requested_session
+        else [(session, _list_panes(session)) for session in _list_sessions()]
+    )
+    if not session_panes and os.environ.get("ZELLIJ"):
+        session_panes = [("", _list_panes(""))]
+
     pane = os.environ.get("ZELLIJ_CODEX_PANE_ID") or os.environ.get(
         "ZELLIJ_PANE_ID", ""
     )
-    if pane.isdigit():
-        tab_id, tab_position = _pane_location(panes, int(pane))
-        return (
-            pane,
-            tab_id if tab_id is not None else _environment_int("ZELLIJ_CODEX_TAB_ID"),
-            tab_position
-            if tab_position is not None
-            else _environment_int("ZELLIJ_CODEX_TAB_POSITION"),
-        )
-
     candidates = [
-        pane_info
+        (session, pane_info)
+        for session, panes in session_panes
         for pane_info in panes
-        if _is_codex_pane(pane_info) and _pane_cwd(pane_info) == cwd.resolve()
+        if (
+            not pane_info.get("is_plugin", False)
+            and not pane_info.get("exited", False)
+            and _pane_cwd(pane_info) == cwd.resolve()
+            and (
+                pane_info.get("id") == int(pane)
+                if pane.isdigit()
+                else _is_codex_pane(pane_info)
+            )
+        )
     ]
     if len(candidates) != 1:
-        return "", None, None
+        return "", "", None, None
 
-    pane_info = candidates[0]
+    session, pane_info = candidates[0]
     pane_id = pane_info.get("id")
     if not isinstance(pane_id, int):
-        return "", None, None
+        return "", "", None, None
     tab_id = pane_info.get("tab_id")
     tab_position = pane_info.get("tab_position")
+    if pane.isdigit():
+        return (
+            session,
+            pane,
+            tab_id
+            if isinstance(tab_id, int)
+            else _environment_int("ZELLIJ_CODEX_TAB_ID"),
+            tab_position
+            if isinstance(tab_position, int)
+            else _environment_int("ZELLIJ_CODEX_TAB_POSITION"),
+        )
     return (
+        session,
         str(pane_id),
         tab_id if isinstance(tab_id, int) else None,
         tab_position if isinstance(tab_position, int) else None,
     )
 
 
-def _list_panes() -> list[dict[str, object]]:
+def _list_sessions() -> list[str]:
     try:
         result = subprocess.run(
-            ["zellij", "action", "list-panes", "--all", "--json"],
+            ["zellij", "list-sessions", "--short"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    return [session for line in result.stdout.splitlines() if (session := line.strip())]
+
+
+def _list_panes(session: str) -> list[dict[str, object]]:
+    command = ["zellij"]
+    if session:
+        command.extend(["--session", session])
+    command.extend(["action", "list-panes", "--all", "--json"])
+    try:
+        result = subprocess.run(
+            command,
             check=False,
             capture_output=True,
             text=True,
@@ -81,20 +156,6 @@ def _list_panes() -> list[dict[str, object]]:
     if not isinstance(panes, list):
         return []
     return [pane_info for pane_info in panes if isinstance(pane_info, dict)]
-
-
-def _pane_location(
-    panes: list[dict[str, object]], pane_id: int
-) -> tuple[int | None, int | None]:
-    for pane_info in panes:
-        if not pane_info.get("is_plugin", False) and pane_info.get("id") == pane_id:
-            tab_id = pane_info.get("tab_id")
-            tab_position = pane_info.get("tab_position")
-            return (
-                tab_id if isinstance(tab_id, int) else None,
-                tab_position if isinstance(tab_position, int) else None,
-            )
-    return None, None
 
 
 def _pane_cwd(pane_info: dict[str, object]) -> Path | None:
@@ -130,18 +191,10 @@ def main() -> int:
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return 0
 
-    # Hooks outside Zellij must never launch or update a dashboard in an
-    # unrelated session.
-    if not any(
-        os.environ.get(name)
-        for name in ("ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_CODEX_PANE_ID")
-    ):
-        return 0
-
+    restore_zellij_socket_dir()
     cwd = Path(str(payload.get("cwd") or os.getcwd()))
-    pane, tab_id, tab_position = pane_context(cwd)
-    zellij_session = os.environ.get("ZELLIJ_SESSION_NAME", "")
-    if not pane and not zellij_session:
+    zellij_session, pane, tab_id, tab_position = pane_context(cwd)
+    if not pane:
         return 0
     report = {
         # The pane identity is available before Codex creates a session. This
@@ -166,18 +219,23 @@ def main() -> int:
         Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
         / "zellij/plugins/zellij-codex.wasm"
     )
+    command = ["zellij"]
+    if zellij_session:
+        command.extend(["--session", zellij_session])
+    command.extend(
+        [
+            "pipe",
+            "--plugin",
+            f"file:{plugin}",
+            "--name",
+            "codex_status",
+            "--",
+            json.dumps(report, separators=(",", ":")),
+        ]
+    )
     try:
         subprocess.run(
-            [
-                "zellij",
-                "pipe",
-                "--plugin",
-                f"file:{plugin}",
-                "--name",
-                "codex_status",
-                "--",
-                json.dumps(report, separators=(",", ":")),
-            ],
+            command,
             check=False,
             timeout=2,
             stdout=subprocess.DEVNULL,

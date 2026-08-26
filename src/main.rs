@@ -237,18 +237,12 @@ impl App {
     }
 
     fn neovim_pane_id(&self, tab_position: usize) -> Option<PaneId> {
-        let pane_id = self
-            .pane_manifest
-            .panes
-            .get(&tab_position)?
-            .iter()
-            .find(|pane| {
-                !pane.is_plugin
-                    && pane.is_floating
-                    && !pane.is_suppressed
-                    && pane.title == NEOVIM_PANE_TITLE
-            })
-            .map(|pane| PaneId::Terminal(pane.id))?;
+        // PaneUpdate can lag behind show_pane_with_id()/hide_pane_with_id(). Use
+        // the manifest only to locate Neovim's stable pane ID, then decide from
+        // the synchronous live pane state. Otherwise a manifest captured while
+        // Neovim was suppressed prevents the next dashboard opening from hiding
+        // it, and show_self() reveals both floating panes.
+        let pane_id = neovim_pane_candidate(self.pane_manifest.panes.get(&tab_position)?)?;
         get_pane_info(pane_id)
             .filter(|pane| {
                 !pane.is_plugin
@@ -381,6 +375,16 @@ impl App {
         self.reconcile_discovered_panes(discovered)
     }
 
+    fn reconcile_live_panes(&mut self, live_pane_ids: &BTreeSet<u32>) -> bool {
+        let agents_before = self.agents.clone();
+        self.agents.retain(|_, agent| {
+            agent
+                .pane_id
+                .map_or(true, |pane_id| live_pane_ids.contains(&pane_id))
+        });
+        self.agents != agents_before
+    }
+
     fn reconcile_discovered_panes(
         &mut self,
         discovered: Vec<(u32, String, Option<usize>, usize)>,
@@ -427,7 +431,15 @@ impl App {
     }
 
     fn update_pane_manifest(&mut self, pane_manifest: PaneManifest) -> bool {
-        let mut should_render = self.discover_codex_panes(&pane_manifest);
+        let live_pane_ids = pane_manifest
+            .panes
+            .values()
+            .flatten()
+            .filter(|pane| !pane.is_plugin && !pane.exited)
+            .map(|pane| pane.id)
+            .collect::<BTreeSet<_>>();
+        let mut should_render = self.reconcile_live_panes(&live_pane_ids);
+        should_render |= self.discover_codex_panes(&pane_manifest);
         self.pane_manifest = pane_manifest;
         should_render |= self.refresh_current_view();
         if let Some(pending) = self.pending_neovim_suppression {
@@ -570,6 +582,13 @@ fn is_codex_command(command: &[String]) -> bool {
     })
 }
 
+fn neovim_pane_candidate(panes: &[PaneInfo]) -> Option<PaneId> {
+    panes
+        .iter()
+        .find(|pane| !pane.is_plugin && !pane.exited && pane.title == NEOVIM_PANE_TITLE)
+        .map(|pane| PaneId::Terminal(pane.id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +704,19 @@ mod tests {
     }
 
     #[test]
+    fn stale_suppressed_neovim_is_still_a_live_lookup_candidate() {
+        let panes = vec![PaneInfo {
+            id: 17,
+            title: NEOVIM_PANE_TITLE.to_string(),
+            is_floating: false,
+            is_suppressed: true,
+            ..PaneInfo::default()
+        }];
+
+        assert_eq!(neovim_pane_candidate(&panes), Some(PaneId::Terminal(17)));
+    }
+
+    #[test]
     fn hook_reports_replace_discovery_and_closed_panes_are_removed() {
         let mut app = App::default();
         app.reconcile_discovered_panes(vec![(12, "demo".to_string(), Some(3), 2)]);
@@ -703,10 +735,22 @@ mod tests {
         assert_eq!(app.agents.len(), 1);
         assert!(app.agents.contains_key("quadratic-tiger:pane:12"));
 
-        app.agents.clear();
-        app.reconcile_discovered_panes(vec![(12, "demo".to_string(), Some(3), 2)]);
-        app.reconcile_discovered_panes(Vec::new());
-        assert!(app.agents.is_empty());
+        app.apply_report(AgentReport {
+            id: "remote-agent".to_string(),
+            agent: "remote-codex".to_string(),
+            status: Status::Done,
+            task: "Remote result".to_string(),
+            worktree: "remote".to_string(),
+            pane_id: None,
+            tab_id: None,
+            tab_position: None,
+            remove: false,
+        });
+        assert!(!app.reconcile_live_panes(&BTreeSet::from([12])));
+
+        assert!(app.reconcile_live_panes(&BTreeSet::new()));
+        assert_eq!(app.agents.len(), 1);
+        assert!(app.agents.contains_key("remote-agent"));
     }
 
     #[test]
