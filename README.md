@@ -30,13 +30,6 @@ installs the lifecycle and launch reporters in `~/.local/bin`, installs a fish
 makes a pane visible immediately, before Codex creates its conversation ID;
 subsequent lifecycle hooks update that same pane row.
 
-The dashboard also discovers Codex processes from Zellij's live pane list.
-This includes Codex panes created by layouts and worktree launchers, even when
-they bypass the installed shell function. Accept Zellij's
-`ReadApplicationState` and `ReadCliPipes` permission prompt the first time the
-updated plugin is opened. Lifecycle reports replace the discovered row in
-place when available.
-
 Start Codex once after installation. Codex will show a **Hooks need review**
 screen; choose **Trust all and continue** after reviewing the command. New
 Codex conversations opened inside Zellij will then register automatically.
@@ -173,11 +166,10 @@ Implemented now:
 - colored terminal rendering;
 - automatic SessionStart, UserPromptSubmit, PermissionRequest, Stop, and
   SessionEnd lifecycle reporting through `zellij pipe`;
-- discovery of Codex processes already running in Zellij terminal panes;
 - a manual producer for testing.
 
 Deliberately deferred until this transport is proven inside Zellij:
 
-- tab discovery and aggregation;
+- pane/tab discovery and aggregation;
 - persistence, expiry/heartbeat semantics, and navigation;
 - tab-bar integration.

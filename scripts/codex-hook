@@ -13,7 +13,7 @@ def status_for(event: str) -> str:
         "SessionStart": "idle",
         "UserPromptSubmit": "running",
         "PermissionRequest": "input",
-        "Stop": "done",
+        "Stop": "idle",
         "SessionEnd": "done",
     }.get(event, "running")
 

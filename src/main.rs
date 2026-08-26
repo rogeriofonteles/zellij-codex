@@ -1,8 +1,7 @@
 //! Zellij plugin entry point and the first one-agent vertical slice.
 
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
 const PIPE_NAME: &str = "codex_status";
@@ -74,143 +73,33 @@ struct AgentReport {
 #[derive(Default)]
 struct App {
     agents: BTreeMap<String, AgentReport>,
-    focused_pane_id: Option<u32>,
     error: Option<String>,
 }
 
 register_plugin!(App);
 
 impl App {
-    fn apply_report(&mut self, mut agent: AgentReport) {
+    fn apply_report(&mut self, agent: AgentReport) {
         if agent.remove {
             self.agents.remove(&agent.id);
-            if let Some(pane_id) = agent.pane_id {
-                self.agents
-                    .retain(|_, existing| existing.pane_id != Some(pane_id));
-            }
         } else {
-            if agent.status == Status::Done && agent.pane_id == self.focused_pane_id {
-                agent.status = Status::Idle;
-            }
-            if let Some(pane_id) = agent.pane_id {
-                self.agents
-                    .retain(|_, existing| existing.pane_id != Some(pane_id));
-            }
             self.agents.insert(agent.id.clone(), agent);
-        }
-    }
-
-    fn observe_focused_pane(&mut self, pane_id: PaneId) {
-        self.focused_pane_id = match pane_id {
-            PaneId::Terminal(pane_id) => Some(pane_id),
-            PaneId::Plugin(_) => None,
-        };
-
-        if let Some(pane_id) = self.focused_pane_id {
-            for agent in self.agents.values_mut() {
-                if agent.pane_id == Some(pane_id) && agent.status == Status::Done {
-                    agent.status = Status::Idle;
-                }
-            }
-        }
-    }
-
-    fn refresh_focused_pane(&mut self) {
-        if let Ok((_, pane_id)) = get_focused_pane_info() {
-            self.observe_focused_pane(pane_id);
-        }
-    }
-
-    fn discover_codex_panes(&mut self, pane_manifest: PaneManifest) {
-        let mut discovered = Vec::new();
-
-        for pane in pane_manifest.panes.values().flatten() {
-            if pane.is_plugin || pane.exited {
-                continue;
-            }
-
-            let pane_id = PaneId::Terminal(pane.id);
-            let running_command = get_pane_running_command(pane_id).unwrap_or_default();
-            let launch_command = pane.terminal_command.iter().cloned().collect::<Vec<_>>();
-            if !is_codex_command(&running_command) && !is_codex_command(&launch_command) {
-                continue;
-            }
-
-            let worktree = get_pane_cwd(pane_id)
-                .ok()
-                .and_then(|cwd| {
-                    cwd.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                })
-                .unwrap_or_default();
-            discovered.push((pane.id, worktree));
-        }
-
-        self.reconcile_discovered_panes(discovered);
-    }
-
-    fn reconcile_discovered_panes(&mut self, discovered: Vec<(u32, String)>) {
-        let discovered_pane_ids = discovered
-            .iter()
-            .map(|(pane_id, _)| *pane_id)
-            .collect::<BTreeSet<_>>();
-        self.agents.retain(|id, agent| {
-            !id.starts_with("discovered:pane:")
-                || agent
-                    .pane_id
-                    .is_some_and(|pane_id| discovered_pane_ids.contains(&pane_id))
-        });
-
-        for (pane_id, worktree) in discovered {
-            if self
-                .agents
-                .values()
-                .any(|agent| agent.pane_id == Some(pane_id))
-            {
-                continue;
-            }
-
-            let id = format!("discovered:pane:{pane_id}");
-            self.agents.insert(
-                id.clone(),
-                AgentReport {
-                    id,
-                    agent: format!("codex-{pane_id}"),
-                    status: Status::Idle,
-                    task: "Discovered running Codex".to_string(),
-                    worktree,
-                    pane_id: Some(pane_id),
-                    remove: false,
-                },
-            );
         }
     }
 }
 
 impl ZellijPlugin for App {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::ReadCliPipes,
-        ]);
-        subscribe(&[EventType::Key, EventType::PaneUpdate, EventType::TabUpdate]);
+        subscribe(&[EventType::Key]);
     }
 
     fn update(&mut self, event: Event) -> bool {
-        match event {
-            Event::Key(key) => {
-                if key.bare_key == BareKey::Esc && key.key_modifiers.is_empty() {
-                    hide_self();
-                }
+        if let Event::Key(key) = event {
+            if key.bare_key == BareKey::Esc && key.key_modifiers.is_empty() {
+                hide_self();
             }
-            Event::PaneUpdate(pane_manifest) => {
-                self.discover_codex_panes(pane_manifest);
-                self.refresh_focused_pane();
-            }
-            Event::TabUpdate(_) => self.refresh_focused_pane(),
-            _ => {}
         }
-        true
+        false
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
@@ -225,7 +114,6 @@ impl ZellijPlugin for App {
         match serde_json::from_str(&payload) {
             Ok(agent) => {
                 let agent: AgentReport = agent;
-                self.refresh_focused_pane();
                 self.apply_report(agent);
                 self.error = None;
             }
@@ -288,22 +176,6 @@ fn truncate(value: &str, max_chars: usize) -> String {
     } else {
         prefix
     }
-}
-
-fn is_codex_command(command: &[String]) -> bool {
-    command.iter().any(|argument| {
-        argument
-            .split(|character: char| {
-                character.is_whitespace() || matches!(character, '\'' | '"' | ';' | '|' | '&')
-            })
-            .filter(|token| !token.is_empty())
-            .any(|token| {
-                matches!(
-                    Path::new(token).file_name().and_then(|name| name.to_str()),
-                    Some("codex" | "codex.js" | "zellij-codex-launch")
-                )
-            })
-    })
 }
 
 #[cfg(test)]
@@ -389,81 +261,6 @@ mod tests {
             pane_id: Some(12),
             remove: true,
         });
-
-        assert!(app.agents.is_empty());
-    }
-
-    #[test]
-    fn discovers_codex_commands_started_by_a_workbench() {
-        assert!(is_codex_command(&[
-            "node".to_string(),
-            "/usr/bin/codex".to_string(),
-            "--yolo".to_string(),
-        ]));
-        assert!(is_codex_command(&[
-            "bash".to_string(),
-            "if command -v zellij-codex-launch; then exec zellij-codex-launch --yolo; fi"
-                .to_string(),
-        ]));
-        assert!(!is_codex_command(&[
-            "bash".to_string(),
-            "-lc".to_string(),
-            "nvim .".to_string(),
-        ]));
-    }
-
-    #[test]
-    fn a_hook_report_replaces_the_discovered_pane() {
-        let mut app = App::default();
-        app.reconcile_discovered_panes(vec![(12, "demo".to_string())]);
-
-        app.apply_report(AgentReport {
-            id: "quadratic-tiger:pane:12".to_string(),
-            agent: "codex-12".to_string(),
-            status: Status::Running,
-            task: "Implement pane discovery".to_string(),
-            worktree: "demo".to_string(),
-            pane_id: Some(12),
-            remove: false,
-        });
-
-        assert_eq!(app.agents.len(), 1);
-        assert_eq!(app.agents.values().next().unwrap().status, Status::Running);
-        assert!(app.agents.contains_key("quadratic-tiger:pane:12"));
-    }
-
-    #[test]
-    fn a_completed_response_is_done_until_its_pane_is_focused() {
-        let mut app = App::default();
-        let report = AgentReport {
-            id: "quadratic-tiger:pane:12".to_string(),
-            agent: "codex-12".to_string(),
-            status: Status::Done,
-            task: "Implemented the requested change".to_string(),
-            worktree: "demo".to_string(),
-            pane_id: Some(12),
-            remove: false,
-        };
-
-        app.apply_report(report.clone());
-        assert_eq!(app.agents[&report.id].status, Status::Done);
-
-        app.observe_focused_pane(PaneId::Terminal(7));
-        assert_eq!(app.agents[&report.id].status, Status::Done);
-
-        app.observe_focused_pane(PaneId::Terminal(12));
-        assert_eq!(app.agents[&report.id].status, Status::Idle);
-
-        app.apply_report(report.clone());
-        assert_eq!(app.agents[&report.id].status, Status::Idle);
-    }
-
-    #[test]
-    fn removes_a_discovered_agent_after_its_pane_closes() {
-        let mut app = App::default();
-        app.reconcile_discovered_panes(vec![(12, "demo".to_string())]);
-
-        app.reconcile_discovered_panes(Vec::new());
 
         assert!(app.agents.is_empty());
     }
