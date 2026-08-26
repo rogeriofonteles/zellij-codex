@@ -8,12 +8,20 @@ scripts/report-status
   -> Zellij WASM plugin pipe() callback
   -> validate + replace one in-memory AgentReport
   -> ANSI-colored row
+
+Zellij PaneUpdate
+  -> discover live Codex terminal panes
+  -> reconcile discovered rows with lifecycle reports by pane ID
+  -> map each result to its stable Zellij tab identity
+  -> clear only results in the active, visibly tiled Git/Codex view
 ```
 
 Zellij's pipe transport is the smallest native boundary: it is session-local,
 does not require a daemon or filesystem polling, and can target a particular
-plugin URL. Later, the report envelope should gain a schema version, Zellij
-session, stable agent ID, pane ID, tab ID, timestamp, and sequence number.
+plugin URL. Live pane discovery covers processes started by layouts and
+workbench launchers, while pane IDs de-duplicate both sources within the
+session. Later, the report envelope should gain a schema version, Zellij
+session, stable agent ID, timestamp, and sequence number.
 
 ## Codex 0.147.0 findings
 

@@ -1,7 +1,8 @@
 //! Zellij plugin entry point for the Codex status dashboard.
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use zellij_tile::prelude::*;
 
 const PIPE_NAME: &str = "codex_status";
@@ -70,12 +71,17 @@ struct AgentReport {
     #[serde(default)]
     pane_id: Option<u32>,
     #[serde(default)]
+    tab_id: Option<usize>,
+    #[serde(default)]
+    tab_position: Option<usize>,
+    #[serde(default)]
     remove: bool,
 }
 
 #[derive(Default)]
 struct App {
     agents: BTreeMap<String, AgentReport>,
+    focused_pane_id: Option<u32>,
     error: Option<String>,
     pane_manifest: PaneManifest,
     tabs: Vec<TabInfo>,
@@ -98,27 +104,45 @@ struct PendingNeovimSuppression {
 register_plugin!(App);
 
 impl App {
-    fn apply_report(&mut self, agent: AgentReport) {
+    fn apply_report(&mut self, mut agent: AgentReport) {
+        if let Some(pane_id) = agent.pane_id {
+            let (known_tab_id, known_tab_position) = self.known_tab_location(pane_id);
+            agent.tab_id = agent.tab_id.or(known_tab_id);
+            agent.tab_position = agent.tab_position.or(known_tab_position);
+        }
         if agent.remove {
             self.agents.remove(&agent.id);
+            if let Some(pane_id) = agent.pane_id {
+                self.agents
+                    .retain(|_, existing| existing.pane_id != Some(pane_id));
+            }
         } else {
+            if agent.status == Status::Done && agent.pane_id == self.focused_pane_id {
+                agent.status = Status::Idle;
+            }
+            if let Some(pane_id) = agent.pane_id {
+                self.agents
+                    .retain(|_, existing| existing.pane_id != Some(pane_id));
+            }
             self.agents.insert(agent.id.clone(), agent);
         }
     }
 
     fn show_dashboard(&mut self) {
-        let Ok((tab_position, _)) = get_focused_pane_info() else {
+        let Ok((tab_position, focused_pane_id)) = get_focused_pane_info() else {
             self.error = Some("could not determine the focused Zellij pane".to_string());
             show_self(true);
             self.center_dashboard();
             return;
         };
 
+        let codex_surface_is_visible = !self.floating_panes_are_visible(tab_position);
+        self.observe_current_view(tab_position, focused_pane_id, codex_surface_is_visible);
         self.error = None;
         self.suppressed_neovim = None;
         self.pending_neovim_suppression = None;
         let tab_id = self.tab_id_at_position(tab_position);
-        let should_suppress_neovim = !self.floating_panes_are_visible(tab_position);
+        let should_suppress_neovim = codex_surface_is_visible;
         let neovim_to_suppress = should_suppress_neovim
             .then(|| self.neovim_pane_id(tab_position))
             .flatten();
@@ -177,6 +201,30 @@ impl App {
             .map(|tab| tab.tab_id)
     }
 
+    fn known_tab_location(&self, pane_id: u32) -> (Option<usize>, Option<usize>) {
+        if let Some(agent) = self
+            .agents
+            .values()
+            .find(|agent| agent.pane_id == Some(pane_id))
+        {
+            if agent.tab_id.is_some() || agent.tab_position.is_some() {
+                return (agent.tab_id, agent.tab_position);
+            }
+        }
+
+        self.pane_manifest
+            .panes
+            .iter()
+            .find(|(_, panes)| {
+                panes
+                    .iter()
+                    .any(|pane| !pane.is_plugin && pane.id == pane_id)
+            })
+            .map_or((None, None), |(tab_position, _)| {
+                (self.tab_id_at_position(*tab_position), Some(*tab_position))
+            })
+    }
+
     fn floating_panes_are_visible(&self, tab_position: usize) -> bool {
         let cached_visibility = self
             .tabs
@@ -223,17 +271,173 @@ impl App {
             .map(|(tab_position, _)| *tab_position)
     }
 
-    fn update_pane_manifest(&mut self, pane_manifest: PaneManifest) {
-        self.pane_manifest = pane_manifest;
-        let Some(pending) = self.pending_neovim_suppression else {
-            return;
-        };
-        let Some(neovim_pane_id) = self.neovim_pane_id(pending.tab_position) else {
-            return;
+    fn observe_focused_pane(&mut self, pane_id: PaneId) -> bool {
+        self.focused_pane_id = match pane_id {
+            PaneId::Terminal(pane_id) => Some(pane_id),
+            PaneId::Plugin(_) => None,
         };
 
-        self.pending_neovim_suppression = None;
-        self.suppress_neovim(neovim_pane_id, pending.tab_id);
+        let mut status_changed = false;
+        if let Some(pane_id) = self.focused_pane_id {
+            for agent in self.agents.values_mut() {
+                if agent.pane_id == Some(pane_id) && agent.status == Status::Done {
+                    agent.status = Status::Idle;
+                    status_changed = true;
+                }
+            }
+        }
+        status_changed
+    }
+
+    fn observe_current_view(
+        &mut self,
+        tab_position: usize,
+        pane_id: PaneId,
+        codex_surface_is_visible: bool,
+    ) -> bool {
+        let mut status_changed = self.observe_focused_pane(pane_id);
+        if codex_surface_is_visible {
+            let visible_pane_ids = self
+                .pane_manifest
+                .panes
+                .get(&tab_position)
+                .into_iter()
+                .flatten()
+                .filter(|pane| !pane.is_plugin && !pane.exited && !pane.is_suppressed)
+                .map(|pane| pane.id)
+                .collect::<BTreeSet<_>>();
+            status_changed |= self.observe_active_tab(
+                self.tab_id_at_position(tab_position),
+                tab_position,
+                &visible_pane_ids,
+            );
+        }
+        status_changed
+    }
+
+    fn observe_active_tab(
+        &mut self,
+        tab_id: Option<usize>,
+        tab_position: usize,
+        visible_pane_ids: &BTreeSet<u32>,
+    ) -> bool {
+        let mut status_changed = false;
+        for agent in self.agents.values_mut() {
+            let stable_tab_matches = agent
+                .tab_id
+                .zip(tab_id)
+                .is_some_and(|(agent_tab_id, active_tab_id)| agent_tab_id == active_tab_id);
+            let position_matches = (agent.tab_id.is_none() || tab_id.is_none())
+                && agent.tab_position == Some(tab_position);
+            let pane_is_visible = agent
+                .pane_id
+                .is_some_and(|pane_id| visible_pane_ids.contains(&pane_id));
+            if (stable_tab_matches || position_matches || pane_is_visible)
+                && agent.status == Status::Done
+            {
+                agent.status = Status::Idle;
+                status_changed = true;
+            }
+        }
+        status_changed
+    }
+
+    fn refresh_current_view(&mut self) -> bool {
+        let Ok((tab_position, pane_id)) = get_focused_pane_info() else {
+            return false;
+        };
+        let codex_surface_is_visible = !self.floating_panes_are_visible(tab_position);
+        self.observe_current_view(tab_position, pane_id, codex_surface_is_visible)
+    }
+
+    fn discover_codex_panes(&mut self, pane_manifest: &PaneManifest) -> bool {
+        let mut discovered = Vec::new();
+
+        for (tab_position, panes) in &pane_manifest.panes {
+            let tab_id = self.tab_id_at_position(*tab_position);
+            for pane in panes {
+                if pane.is_plugin || pane.exited {
+                    continue;
+                }
+
+                let pane_id = PaneId::Terminal(pane.id);
+                let running_command = get_pane_running_command(pane_id).unwrap_or_default();
+                let launch_command = pane.terminal_command.iter().cloned().collect::<Vec<_>>();
+                if !is_codex_command(&running_command) && !is_codex_command(&launch_command) {
+                    continue;
+                }
+
+                let worktree = get_pane_cwd(pane_id)
+                    .ok()
+                    .and_then(|cwd| {
+                        cwd.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_default();
+                discovered.push((pane.id, worktree, tab_id, *tab_position));
+            }
+        }
+
+        self.reconcile_discovered_panes(discovered)
+    }
+
+    fn reconcile_discovered_panes(
+        &mut self,
+        discovered: Vec<(u32, String, Option<usize>, usize)>,
+    ) -> bool {
+        let agents_before = self.agents.clone();
+        let discovered_pane_ids = discovered
+            .iter()
+            .map(|(pane_id, _, _, _)| *pane_id)
+            .collect::<BTreeSet<_>>();
+        self.agents.retain(|id, agent| {
+            !id.starts_with("discovered:pane:")
+                || agent
+                    .pane_id
+                    .is_some_and(|pane_id| discovered_pane_ids.contains(&pane_id))
+        });
+
+        for (pane_id, worktree, tab_id, tab_position) in discovered {
+            if self
+                .agents
+                .values()
+                .any(|agent| agent.pane_id == Some(pane_id))
+            {
+                continue;
+            }
+
+            let id = format!("discovered:pane:{pane_id}");
+            self.agents.insert(
+                id.clone(),
+                AgentReport {
+                    id,
+                    agent: format!("codex-{pane_id}"),
+                    status: Status::Idle,
+                    task: "Discovered running Codex".to_string(),
+                    worktree,
+                    pane_id: Some(pane_id),
+                    tab_id,
+                    tab_position: Some(tab_position),
+                    remove: false,
+                },
+            );
+        }
+
+        self.agents != agents_before
+    }
+
+    fn update_pane_manifest(&mut self, pane_manifest: PaneManifest) -> bool {
+        let mut should_render = self.discover_codex_panes(&pane_manifest);
+        self.pane_manifest = pane_manifest;
+        should_render |= self.refresh_current_view();
+        if let Some(pending) = self.pending_neovim_suppression {
+            if let Some(neovim_pane_id) = self.neovim_pane_id(pending.tab_position) {
+                self.pending_neovim_suppression = None;
+                self.suppress_neovim(neovim_pane_id, pending.tab_id);
+            }
+        }
+
+        should_render
     }
 
     fn suppress_neovim(&mut self, pane_id: PaneId, tab_id: Option<usize>) {
@@ -256,12 +460,15 @@ impl ZellijPlugin for App {
         match event {
             Event::Key(key) if key.bare_key == BareKey::Esc && key.key_modifiers.is_empty() => {
                 self.hide_dashboard();
+                false
             }
             Event::PaneUpdate(pane_manifest) => self.update_pane_manifest(pane_manifest),
-            Event::TabUpdate(tabs) => self.tabs = tabs,
-            _ => {}
+            Event::TabUpdate(tabs) => {
+                self.tabs = tabs;
+                self.refresh_current_view()
+            }
+            _ => false,
         }
-        false
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
@@ -283,6 +490,7 @@ impl ZellijPlugin for App {
             Ok(agent) => {
                 let agent: AgentReport = agent;
                 self.apply_report(agent);
+                self.refresh_current_view();
                 self.error = None;
             }
             Err(error) => self.error = Some(format!("invalid status report: {error}")),
@@ -346,6 +554,22 @@ fn truncate(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn is_codex_command(command: &[String]) -> bool {
+    command.iter().any(|argument| {
+        argument
+            .split(|character: char| {
+                character.is_whitespace() || matches!(character, '\'' | '"' | ';' | '|' | '&')
+            })
+            .filter(|token| !token.is_empty())
+            .any(|token| {
+                matches!(
+                    Path::new(token).file_name().and_then(|name| name.to_str()),
+                    Some("codex" | "codex.js" | "zellij-codex-launch")
+                )
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,7 +577,7 @@ mod tests {
     #[test]
     fn parses_a_status_report() {
         let report: AgentReport = serde_json::from_str(
-            r#"{"id":"thread-1","agent":"implementation","status":"running","task":"Migrating grpc","worktree":"grpc-migration","pane_id":7}"#,
+            r#"{"id":"thread-1","agent":"implementation","status":"running","task":"Migrating grpc","worktree":"grpc-migration","pane_id":7,"tab_id":3,"tab_position":2}"#,
         )
         .unwrap();
 
@@ -362,6 +586,8 @@ mod tests {
         assert_eq!(report.status, Status::Running);
         assert_eq!(report.task, "Migrating grpc");
         assert_eq!(report.worktree, "grpc-migration");
+        assert_eq!(report.tab_id, Some(3));
+        assert_eq!(report.tab_position, Some(2));
     }
 
     #[test]
@@ -395,6 +621,8 @@ mod tests {
                 task: String::new(),
                 worktree: "demo".to_string(),
                 pane_id: None,
+                tab_id: None,
+                tab_position: None,
                 remove: false,
             };
             app.agents.insert(report.id.clone(), report);
@@ -416,6 +644,8 @@ mod tests {
                 task: String::new(),
                 worktree: "demo".to_string(),
                 pane_id: Some(12),
+                tab_id: Some(3),
+                tab_position: Some(2),
                 remove: false,
             },
         );
@@ -427,10 +657,106 @@ mod tests {
             task: String::new(),
             worktree: "demo".to_string(),
             pane_id: Some(12),
+            tab_id: Some(3),
+            tab_position: Some(2),
             remove: true,
         });
 
         assert!(app.agents.is_empty());
+    }
+
+    #[test]
+    fn discovers_workbench_codex_commands() {
+        assert!(is_codex_command(&[
+            "node".to_string(),
+            "/usr/bin/codex".to_string(),
+            "--yolo".to_string(),
+        ]));
+        assert!(is_codex_command(&[
+            "bash".to_string(),
+            "if command -v zellij-codex-launch; then exec zellij-codex-launch --yolo; fi"
+                .to_string(),
+        ]));
+        assert!(!is_codex_command(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "nvim .".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn hook_reports_replace_discovery_and_closed_panes_are_removed() {
+        let mut app = App::default();
+        app.reconcile_discovered_panes(vec![(12, "demo".to_string(), Some(3), 2)]);
+        app.apply_report(AgentReport {
+            id: "quadratic-tiger:pane:12".to_string(),
+            agent: "codex-12".to_string(),
+            status: Status::Running,
+            task: "Implement pane discovery".to_string(),
+            worktree: "demo".to_string(),
+            pane_id: Some(12),
+            tab_id: Some(3),
+            tab_position: Some(2),
+            remove: false,
+        });
+
+        assert_eq!(app.agents.len(), 1);
+        assert!(app.agents.contains_key("quadratic-tiger:pane:12"));
+
+        app.agents.clear();
+        app.reconcile_discovered_panes(vec![(12, "demo".to_string(), Some(3), 2)]);
+        app.reconcile_discovered_panes(Vec::new());
+        assert!(app.agents.is_empty());
+    }
+
+    #[test]
+    fn done_is_unread_until_the_codex_pane_is_observed() {
+        let mut app = App::default();
+        let report = AgentReport {
+            id: "quadratic-tiger:pane:12".to_string(),
+            agent: "codex-12".to_string(),
+            status: Status::Done,
+            task: "Implemented the requested change".to_string(),
+            worktree: "demo".to_string(),
+            pane_id: Some(12),
+            tab_id: Some(3),
+            tab_position: Some(2),
+            remove: false,
+        };
+        let other_report = AgentReport {
+            id: "quadratic-tiger:pane:13".to_string(),
+            agent: "codex-13".to_string(),
+            status: Status::Done,
+            task: "Another completed result".to_string(),
+            worktree: "other".to_string(),
+            pane_id: Some(13),
+            tab_id: Some(4),
+            tab_position: Some(3),
+            remove: false,
+        };
+
+        app.apply_report(report.clone());
+        app.apply_report(other_report.clone());
+        assert_eq!(app.agents[&report.id].status, Status::Done);
+
+        app.observe_focused_pane(PaneId::Terminal(7));
+        assert_eq!(app.agents[&report.id].status, Status::Done);
+
+        app.observe_focused_pane(PaneId::Terminal(12));
+        assert_eq!(app.agents[&report.id].status, Status::Idle);
+        assert_eq!(app.agents[&other_report.id].status, Status::Done);
+
+        app.focused_pane_id = None;
+        app.apply_report(report.clone());
+        app.observe_active_tab(Some(3), 2, &BTreeSet::new());
+        assert_eq!(app.agents[&report.id].status, Status::Idle);
+        assert_eq!(app.agents[&other_report.id].status, Status::Done);
+
+        app.focused_pane_id = None;
+        app.apply_report(report.clone());
+        app.observe_active_tab(None, 2, &BTreeSet::from([12]));
+        assert_eq!(app.agents[&report.id].status, Status::Idle);
+        assert_eq!(app.agents[&other_report.id].status, Status::Done);
     }
 
     #[test]

@@ -13,7 +13,7 @@ def status_for(event: str) -> str:
         "SessionStart": "idle",
         "UserPromptSubmit": "running",
         "PermissionRequest": "input",
-        "Stop": "idle",
+        "Stop": "done",
         "SessionEnd": "done",
     }.get(event, "running")
 
@@ -30,6 +30,98 @@ def task_for(event: str, payload: dict) -> str:
     return "New Codex conversation"
 
 
+def pane_context(cwd: Path) -> tuple[str, int | None, int | None]:
+    panes = _list_panes()
+    pane = os.environ.get("ZELLIJ_CODEX_PANE_ID") or os.environ.get(
+        "ZELLIJ_PANE_ID", ""
+    )
+    if pane.isdigit():
+        tab_id, tab_position = _pane_location(panes, int(pane))
+        return (
+            pane,
+            tab_id if tab_id is not None else _environment_int("ZELLIJ_CODEX_TAB_ID"),
+            tab_position
+            if tab_position is not None
+            else _environment_int("ZELLIJ_CODEX_TAB_POSITION"),
+        )
+
+    candidates = [
+        pane_info
+        for pane_info in panes
+        if _is_codex_pane(pane_info) and _pane_cwd(pane_info) == cwd.resolve()
+    ]
+    if len(candidates) != 1:
+        return "", None, None
+
+    pane_info = candidates[0]
+    pane_id = pane_info.get("id")
+    if not isinstance(pane_id, int):
+        return "", None, None
+    tab_id = pane_info.get("tab_id")
+    tab_position = pane_info.get("tab_position")
+    return (
+        str(pane_id),
+        tab_id if isinstance(tab_id, int) else None,
+        tab_position if isinstance(tab_position, int) else None,
+    )
+
+
+def _list_panes() -> list[dict[str, object]]:
+    try:
+        result = subprocess.run(
+            ["zellij", "action", "list-panes", "--all", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        panes = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+    if not isinstance(panes, list):
+        return []
+    return [pane_info for pane_info in panes if isinstance(pane_info, dict)]
+
+
+def _pane_location(
+    panes: list[dict[str, object]], pane_id: int
+) -> tuple[int | None, int | None]:
+    for pane_info in panes:
+        if not pane_info.get("is_plugin", False) and pane_info.get("id") == pane_id:
+            tab_id = pane_info.get("tab_id")
+            tab_position = pane_info.get("tab_position")
+            return (
+                tab_id if isinstance(tab_id, int) else None,
+                tab_position if isinstance(tab_position, int) else None,
+            )
+    return None, None
+
+
+def _pane_cwd(pane_info: dict[str, object]) -> Path | None:
+    pane_cwd = pane_info.get("pane_cwd")
+    if not isinstance(pane_cwd, str):
+        return None
+    return Path(pane_cwd).resolve()
+
+
+def _is_codex_pane(pane_info: dict[str, object]) -> bool:
+    if pane_info.get("is_plugin", False) or pane_info.get("exited", False):
+        return False
+    commands = (pane_info.get("pane_command"), pane_info.get("terminal_command"))
+    return any(
+        Path(token.strip("'\";|&()")).name
+        in {"codex", "codex.js", "zellij-codex-launch"}
+        for command in commands
+        if isinstance(command, str)
+        for token in command.split()
+    )
+
+
+def _environment_int(name: str) -> int | None:
+    value = os.environ.get(name, "")
+    return int(value) if value.isdigit() else None
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -40,21 +132,34 @@ def main() -> int:
 
     # Hooks outside Zellij must never launch or update a dashboard in an
     # unrelated session.
-    if not os.environ.get("ZELLIJ_SESSION_NAME"):
+    if not any(
+        os.environ.get(name)
+        for name in ("ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_CODEX_PANE_ID")
+    ):
         return 0
 
     cwd = Path(str(payload.get("cwd") or os.getcwd()))
-    pane = os.environ.get("ZELLIJ_PANE_ID", "")
+    pane, tab_id, tab_position = pane_context(cwd)
     zellij_session = os.environ.get("ZELLIJ_SESSION_NAME", "")
+    if not pane and not zellij_session:
+        return 0
     report = {
         # The pane identity is available before Codex creates a session. This
         # lets a launch report and later lifecycle hooks update the same row.
-        "id": f"{zellij_session}:pane:{pane}" if pane else session_id,
+        "id": (
+            f"{zellij_session}:pane:{pane}"
+            if zellij_session and pane
+            else f"pane:{pane}"
+            if pane
+            else session_id
+        ),
         "agent": f"codex-{pane}" if pane else f"codex-{session_id[:8]}",
         "status": status_for(event),
         "task": task_for(event, payload),
         "worktree": cwd.name,
         "pane_id": int(pane) if pane.isdigit() else None,
+        "tab_id": tab_id,
+        "tab_position": tab_position,
         "remove": event == "SessionEnd",
     }
     plugin = os.environ.get("ZELLIJ_CODEX_PLUGIN") or str(

@@ -9,23 +9,137 @@ import sys
 from pathlib import Path
 
 
-def report_launch() -> None:
-    session = os.environ.get("ZELLIJ_SESSION_NAME")
-    pane = os.environ.get("ZELLIJ_PANE_ID", "")
-    if not session or not pane:
+def pane_context(cwd: Path) -> tuple[str, int | None, int | None]:
+    panes = _list_panes()
+    pane = os.environ.get("ZELLIJ_CODEX_PANE_ID") or os.environ.get(
+        "ZELLIJ_PANE_ID", ""
+    )
+    if pane.isdigit():
+        tab_id, tab_position = _pane_location(panes, int(pane))
+        return pane, tab_id, tab_position
+
+    candidates = [
+        pane_info
+        for pane_info in panes
+        if _is_launcher_pane(pane_info) and _pane_cwd(pane_info) == cwd.resolve()
+    ]
+    running_candidates = [
+        pane_info
+        for pane_info in candidates
+        if _command_contains_launcher(pane_info.get("pane_command"))
+    ]
+    if running_candidates:
+        candidates = running_candidates
+    if len(candidates) != 1:
+        return "", None, None
+
+    pane_info = candidates[0]
+    pane_id = pane_info.get("id")
+    if not isinstance(pane_id, int):
+        return "", None, None
+    tab_id = pane_info.get("tab_id")
+    tab_position = pane_info.get("tab_position")
+    return (
+        str(pane_id),
+        tab_id if isinstance(tab_id, int) else None,
+        tab_position if isinstance(tab_position, int) else None,
+    )
+
+
+def configure_pane_identity(
+    pane: str, tab_id: int | None, tab_position: int | None
+) -> None:
+    if not pane:
         return
-    plugin = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "zellij/plugins/zellij-codex.wasm"
+    os.environ["ZELLIJ_CODEX_PANE_ID"] = pane
+    if tab_id is not None:
+        os.environ["ZELLIJ_CODEX_TAB_ID"] = str(tab_id)
+    if tab_position is not None:
+        os.environ["ZELLIJ_CODEX_TAB_POSITION"] = str(tab_position)
+
+
+def _list_panes() -> list[dict[str, object]]:
+    try:
+        result = subprocess.run(
+            ["zellij", "action", "list-panes", "--all", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        panes = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return []
+    if not isinstance(panes, list):
+        return []
+    return [pane_info for pane_info in panes if isinstance(pane_info, dict)]
+
+
+def _pane_location(
+    panes: list[dict[str, object]], pane_id: int
+) -> tuple[int | None, int | None]:
+    for pane_info in panes:
+        if not pane_info.get("is_plugin", False) and pane_info.get("id") == pane_id:
+            tab_id = pane_info.get("tab_id")
+            tab_position = pane_info.get("tab_position")
+            return (
+                tab_id if isinstance(tab_id, int) else None,
+                tab_position if isinstance(tab_position, int) else None,
+            )
+    return None, None
+
+
+def _pane_cwd(pane_info: dict[str, object]) -> Path | None:
+    pane_cwd = pane_info.get("pane_cwd")
+    if not isinstance(pane_cwd, str):
+        return None
+    return Path(pane_cwd).resolve()
+
+
+def _is_launcher_pane(pane_info: dict[str, object]) -> bool:
+    if pane_info.get("is_plugin", False) or pane_info.get("exited", False):
+        return False
+    commands = (pane_info.get("pane_command"), pane_info.get("terminal_command"))
+    return any(_command_contains_launcher(command) for command in commands)
+
+
+def _command_contains_launcher(command: object) -> bool:
+    return isinstance(command, str) and any(
+        Path(token.strip("'\";|&()")).name == "zellij-codex-launch"
+        for token in command.split()
+    )
+
+
+def report_launch(pane: str, tab_id: int | None, tab_position: int | None) -> None:
+    if not pane:
+        return
+    session = os.environ.get("ZELLIJ_SESSION_NAME", "")
+    plugin = (
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        / "zellij/plugins/zellij-codex.wasm"
+    )
     payload = {
-        "id": f"{session}:pane:{pane}",
+        "id": f"{session}:pane:{pane}" if session else f"pane:{pane}",
         "agent": f"codex-{pane}",
         "status": "idle",
         "task": "Starting Codex",
         "worktree": Path.cwd().name,
         "pane_id": int(pane) if pane.isdigit() else None,
+        "tab_id": tab_id,
+        "tab_position": tab_position,
     }
     try:
         subprocess.run(
-            ["zellij", "pipe", "--plugin", f"file:{plugin}", "--name", "codex_status", "--", json.dumps(payload, separators=(",", ":"))],
+            [
+                "zellij",
+                "pipe",
+                "--plugin",
+                f"file:{plugin}",
+                "--name",
+                "codex_status",
+                "--",
+                json.dumps(payload, separators=(",", ":")),
+            ],
             check=False,
             timeout=2,
             stdout=subprocess.DEVNULL,
@@ -36,7 +150,9 @@ def report_launch() -> None:
 
 
 def main() -> None:
-    report_launch()
+    pane, tab_id, tab_position = pane_context(Path.cwd())
+    configure_pane_identity(pane, tab_id, tab_position)
+    report_launch(pane, tab_id, tab_position)
     executable = shutil.which("codex")
     if not executable:
         raise SystemExit("codex executable not found")

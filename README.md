@@ -30,6 +30,14 @@ installs the lifecycle and launch reporters in `~/.local/bin`, installs a fish
 makes a pane visible immediately, before Codex creates its conversation ID;
 subsequent lifecycle hooks update that same pane row.
 
+The dashboard also discovers Codex processes from Zellij's live pane list, so
+workbench-created panes appear even if they bypass the launch reporter. A
+completed response is shown as `done` while it is unread and changes to `idle`
+when its Codex pane is focused or visible in the active Git/Codex view. A
+full-screen Neovim overlay keeps the result unread until that view is closed.
+Each lifecycle report includes its stable Zellij tab identity, so visiting one
+workbench does not acknowledge completed results from any other workbench.
+
 Start Codex once after installation. Codex will show a **Hooks need review**
 screen; choose **Trust all and continue** after reviewing the command. New
 Codex conversations opened inside Zellij will then register automatically.
@@ -166,7 +174,8 @@ Implemented now:
 - colored terminal rendering;
 - automatic SessionStart, UserPromptSubmit, PermissionRequest, Stop, and
   SessionEnd lifecycle reporting through `zellij pipe`;
-- pane and tab discovery for a workbench-aware floating overlay;
+- discovery of workbench-launched Codex panes and unread results;
+- pane and tab tracking for a workbench-aware floating overlay;
 - a manual producer for testing.
 
 Deliberately deferred until this transport is proven inside Zellij:
