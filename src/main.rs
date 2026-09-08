@@ -85,6 +85,7 @@ struct App {
     error: Option<String>,
     pane_manifest: PaneManifest,
     tabs: Vec<TabInfo>,
+    visible_neovim: Option<SuppressedNeovim>,
     suppressed_neovim: Option<SuppressedNeovim>,
     pending_neovim_suppression: Option<PendingNeovimSuppression>,
 }
@@ -93,6 +94,25 @@ struct App {
 struct SuppressedNeovim {
     pane_id: PaneId,
     tab_id: Option<usize>,
+    rectangle: PaneRectangle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PaneRectangle {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+impl PaneRectangle {
+    fn coordinates(self) -> FloatingPaneCoordinates {
+        FloatingPaneCoordinates::default()
+            .with_x_fixed(self.x)
+            .with_y_fixed(self.y)
+            .with_width_fixed(self.width)
+            .with_height_fixed(self.height)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -135,17 +155,34 @@ impl App {
             self.center_dashboard();
             return;
         };
+        if focused_pane_id == PaneId::Plugin(get_plugin_ids().plugin_id) {
+            self.center_dashboard();
+            return;
+        }
 
-        let codex_surface_is_visible = !self.floating_panes_are_visible(tab_position);
+        let focused_pane_info = get_pane_info(focused_pane_id);
+        let codex_surface_is_visible = focused_pane_info
+            .as_ref()
+            .is_some_and(|pane| !pane.is_floating && !pane.is_suppressed);
         self.observe_current_view(tab_position, focused_pane_id, codex_surface_is_visible);
         self.error = None;
+        self.visible_neovim = focused_pane_info
+            .filter(|pane| {
+                pane.is_floating && !pane.is_suppressed && pane.title == NEOVIM_PANE_TITLE
+            })
+            .map(|pane| SuppressedNeovim {
+                pane_id: focused_pane_id,
+                tab_id: self.tab_id_at_position(tab_position),
+                rectangle: pane_rectangle(&pane),
+            });
         self.suppressed_neovim = None;
         self.pending_neovim_suppression = None;
         let tab_id = self.tab_id_at_position(tab_position);
         let should_suppress_neovim = codex_surface_is_visible;
         let neovim_to_suppress = should_suppress_neovim
             .then(|| self.neovim_pane_id(tab_position))
-            .flatten();
+            .flatten()
+            .and_then(|pane_id| self.neovim_state(pane_id, tab_id));
         if should_suppress_neovim && neovim_to_suppress.is_none() {
             self.pending_neovim_suppression = Some(PendingNeovimSuppression {
                 tab_position,
@@ -157,18 +194,28 @@ impl App {
             hide_self();
         }
         rename_plugin_pane(get_plugin_ids().plugin_id, DASHBOARD_PANE_TITLE);
-        show_self(true);
-        if let Some(neovim_pane_id) = neovim_to_suppress {
-            self.suppress_neovim(neovim_pane_id, tab_id);
+        if let Some(neovim) = neovim_to_suppress {
+            self.suppress_neovim(neovim);
         }
+        show_self(true);
         self.center_dashboard();
+        focus_pane_with_id(PaneId::Plugin(get_plugin_ids().plugin_id), true, true);
     }
 
     fn hide_dashboard(&mut self) {
         self.pending_neovim_suppression = None;
         hide_self();
-        if let Some(neovim) = self.suppressed_neovim.take() {
+        if let Some(neovim) = self.visible_neovim.take() {
+            change_floating_panes_coordinates(vec![(
+                neovim.pane_id,
+                neovim.rectangle.coordinates(),
+            )]);
+        } else if let Some(neovim) = self.suppressed_neovim.take() {
             show_pane_with_id(neovim.pane_id, true, false);
+            change_floating_panes_coordinates(vec![(
+                neovim.pane_id,
+                neovim.rectangle.coordinates(),
+            )]);
             if let Err(error) = hide_floating_panes(neovim.tab_id) {
                 self.error = Some(format!("could not restore the workbench view: {error}"));
             }
@@ -445,16 +492,28 @@ impl App {
         if let Some(pending) = self.pending_neovim_suppression {
             if let Some(neovim_pane_id) = self.neovim_pane_id(pending.tab_position) {
                 self.pending_neovim_suppression = None;
-                self.suppress_neovim(neovim_pane_id, pending.tab_id);
+                if let Some(neovim) = self.neovim_state(neovim_pane_id, pending.tab_id) {
+                    self.suppress_neovim(neovim);
+                }
             }
         }
-
         should_render
     }
 
-    fn suppress_neovim(&mut self, pane_id: PaneId, tab_id: Option<usize>) {
-        hide_pane_with_id(pane_id);
-        self.suppressed_neovim = Some(SuppressedNeovim { pane_id, tab_id });
+    fn neovim_state(&self, pane_id: PaneId, tab_id: Option<usize>) -> Option<SuppressedNeovim> {
+        let Some(pane_info) = get_pane_info(pane_id) else {
+            return None;
+        };
+        Some(SuppressedNeovim {
+            pane_id,
+            tab_id,
+            rectangle: pane_rectangle(&pane_info),
+        })
+    }
+
+    fn suppress_neovim(&mut self, neovim: SuppressedNeovim) {
+        hide_pane_with_id(neovim.pane_id);
+        self.suppressed_neovim = Some(neovim);
     }
 }
 
@@ -589,6 +648,15 @@ fn neovim_pane_candidate(panes: &[PaneInfo]) -> Option<PaneId> {
         .map(|pane| PaneId::Terminal(pane.id))
 }
 
+fn pane_rectangle(pane: &PaneInfo) -> PaneRectangle {
+    PaneRectangle {
+        x: pane.pane_x,
+        y: pane.pane_y,
+        width: pane.pane_columns,
+        height: pane.pane_rows,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,6 +782,27 @@ mod tests {
         }];
 
         assert_eq!(neovim_pane_candidate(&panes), Some(PaneId::Terminal(17)));
+    }
+
+    #[test]
+    fn pane_rectangle_preserves_the_exact_geometry() {
+        let pane = PaneInfo {
+            pane_x: 0,
+            pane_y: 1,
+            pane_columns: 365,
+            pane_rows: 91,
+            ..PaneInfo::default()
+        };
+
+        assert_eq!(
+            pane_rectangle(&pane),
+            PaneRectangle {
+                x: 0,
+                y: 1,
+                width: 365,
+                height: 91,
+            }
+        );
     }
 
     #[test]
