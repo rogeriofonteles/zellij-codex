@@ -1,6 +1,6 @@
 //! Zellij plugin entry point for the Codex status dashboard.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use zellij_tile::prelude::*;
@@ -10,7 +10,7 @@ const SHOW_DASHBOARD_PIPE_NAME: &str = "show_dashboard";
 const DASHBOARD_PANE_TITLE: &str = "Codex Dashboard";
 const NEOVIM_PANE_TITLE: &str = "Neovim";
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Status {
     Running,
@@ -59,7 +59,7 @@ impl Status {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct AgentReport {
     id: String,
     agent: String,
@@ -81,7 +81,9 @@ struct AgentReport {
 #[derive(Default)]
 struct App {
     agents: BTreeMap<String, AgentReport>,
+    dashboard_tab_id: Option<usize>,
     focused_pane_id: Option<u32>,
+    recovered_running_panes: BTreeSet<u32>,
     error: Option<String>,
     pane_manifest: PaneManifest,
     tabs: Vec<TabInfo>,
@@ -149,12 +151,39 @@ impl App {
     }
 
     fn show_dashboard(&mut self) {
-        let Ok((tab_position, focused_pane_id)) = get_focused_pane_info() else {
+        let Ok((tab_id, focused_pane_id)) = get_focused_pane_info() else {
             self.error = Some("could not determine the focused Zellij pane".to_string());
-            show_self(true);
-            self.center_dashboard();
             return;
         };
+        let Some(tab) = get_tab_info(tab_id) else {
+            return;
+        };
+        let tab_position = tab.position;
+        self.tabs.retain(|known| known.tab_id != tab_id);
+        self.tabs.push(tab);
+        // Cross-tab moves can discard panes when tab IDs have gaps. Each tab
+        // keeps its own dashboard pane and receives the current agent reports.
+        if self.dashboard_tab_id != Some(tab_id)
+            && self.plugin_tab_position(get_plugin_ids().plugin_id) != Some(tab_position)
+        {
+            let mut message = MessageToPlugin::new(SHOW_DASHBOARD_PIPE_NAME)
+                .with_plugin_url("zellij:OWN_URL")
+                .with_plugin_config(BTreeMap::from([
+                    ("dashboard_tab_id".to_string(), tab_id.to_string()),
+                    ("caller_cwd".to_string(), ".".to_string()),
+                ]))
+                .with_payload(serde_json::to_string(&self.agents).unwrap())
+                .with_args(BTreeMap::from([(
+                    "target_client_id".to_string(),
+                    get_plugin_ids().client_id.to_string(),
+                )]))
+                .new_plugin_instance_should_float(true);
+            if let Some(args) = message.new_plugin_args.as_mut() {
+                args.should_focus = Some(false);
+            }
+            pipe_message_to_plugin(message);
+            return;
+        }
         if focused_pane_id == PaneId::Plugin(get_plugin_ids().plugin_id) {
             self.center_dashboard();
             return;
@@ -190,9 +219,6 @@ impl App {
             });
         }
 
-        if self.move_to_tab(tab_position) {
-            hide_self();
-        }
         rename_plugin_pane(get_plugin_ids().plugin_id, DASHBOARD_PANE_TITLE);
         if let Some(neovim) = neovim_to_suppress {
             self.suppress_neovim(neovim);
@@ -232,15 +258,6 @@ impl App {
         change_floating_panes_coordinates(vec![(plugin_id, coordinates)]);
     }
 
-    fn move_to_tab(&self, tab_position: usize) -> bool {
-        let plugin_id = get_plugin_ids().plugin_id;
-        if self.plugin_tab_position(plugin_id) != Some(tab_position) {
-            break_panes_to_tab_with_index(&[PaneId::Plugin(plugin_id)], tab_position, false);
-            return true;
-        }
-        false
-    }
-
     fn tab_id_at_position(&self, tab_position: usize) -> Option<usize> {
         self.tabs
             .iter()
@@ -270,17 +287,6 @@ impl App {
             .map_or((None, None), |(tab_position, _)| {
                 (self.tab_id_at_position(*tab_position), Some(*tab_position))
             })
-    }
-
-    fn floating_panes_are_visible(&self, tab_position: usize) -> bool {
-        let cached_visibility = self
-            .tabs
-            .iter()
-            .find(|tab| tab.position == tab_position)
-            .is_some_and(|tab| tab.are_floating_panes_visible);
-        self.tab_id_at_position(tab_position)
-            .and_then(get_tab_info)
-            .map_or(cached_visibility, |tab| tab.are_floating_panes_visible)
     }
 
     fn neovim_pane_id(&self, tab_position: usize) -> Option<PaneId> {
@@ -384,42 +390,115 @@ impl App {
     }
 
     fn refresh_current_view(&mut self) -> bool {
-        let Ok((tab_position, pane_id)) = get_focused_pane_info() else {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.active) else {
             return false;
         };
-        let codex_surface_is_visible = !self.floating_panes_are_visible(tab_position);
-        self.observe_current_view(tab_position, pane_id, codex_surface_is_visible)
+        let position = tab.position;
+        let floating = tab.are_floating_panes_visible;
+        let focused = self
+            .pane_manifest
+            .panes
+            .get(&position)
+            .into_iter()
+            .flatten()
+            .find(|pane| pane.is_focused && !pane.is_suppressed && pane.is_floating == floating)
+            .map(|pane| {
+                if pane.is_plugin {
+                    PaneId::Plugin(pane.id)
+                } else {
+                    PaneId::Terminal(pane.id)
+                }
+            });
+        focused.is_some_and(|pane| self.observe_current_view(position, pane, !floating))
     }
 
     fn discover_codex_panes(&mut self, pane_manifest: &PaneManifest) -> bool {
-        let mut discovered = Vec::new();
-
-        for (tab_position, panes) in &pane_manifest.panes {
-            let tab_id = self.tab_id_at_position(*tab_position);
-            for pane in panes {
-                if pane.is_plugin || pane.exited {
-                    continue;
-                }
-
-                let pane_id = PaneId::Terminal(pane.id);
-                let running_command = get_pane_running_command(pane_id).unwrap_or_default();
-                let launch_command = pane.terminal_command.iter().cloned().collect::<Vec<_>>();
-                if !is_codex_command(&running_command) && !is_codex_command(&launch_command) {
-                    continue;
-                }
-
-                let worktree = get_pane_cwd(pane_id)
-                    .ok()
-                    .and_then(|cwd| {
-                        cwd.file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
+        let discovered = pane_manifest
+            .panes
+            .iter()
+            .flat_map(|(position, panes)| {
+                let tab = self.tabs.iter().find(|tab| tab.position == *position);
+                panes
+                    .iter()
+                    .filter(|pane| !pane.is_plugin && !pane.exited)
+                    .filter(|pane| {
+                        self.agents
+                            .values()
+                            .any(|agent| agent.pane_id == Some(pane.id))
+                            || is_codex_command(
+                                &pane.terminal_command.iter().cloned().collect::<Vec<_>>(),
+                            )
                     })
-                    .unwrap_or_default();
-                discovered.push((pane.id, worktree, tab_id, *tab_position));
-            }
-        }
-
+                    .map(move |pane| {
+                        (
+                            pane.id,
+                            tab.map(|tab| tab.name.clone()).unwrap_or_default(),
+                            tab.map(|tab| tab.tab_id),
+                            *position,
+                        )
+                    })
+            })
+            .collect();
         self.reconcile_discovered_panes(discovered)
+    }
+
+    fn observe_pane_contents(&mut self, pane_id: u32, viewport: &[String]) -> bool {
+        if codex_activity(viewport).is_none() {
+            return false;
+        }
+        if !self
+            .agents
+            .values()
+            .any(|agent| agent.pane_id == Some(pane_id))
+        {
+            let (tab_id, position) = self.known_tab_location(pane_id);
+            let worktree = self
+                .tabs
+                .iter()
+                .find(|tab| Some(tab.position) == position)
+                .map(|tab| tab.name.clone())
+                .unwrap_or_default();
+            self.apply_report(AgentReport {
+                id: format!("discovered:pane:{pane_id}"),
+                agent: format!("codex-{pane_id}"),
+                status: Status::Idle,
+                task: "Discovered running Codex".to_string(),
+                worktree,
+                pane_id: Some(pane_id),
+                tab_id,
+                tab_position: position,
+                remove: false,
+            });
+            self.observe_activity(pane_id, viewport);
+            return true;
+        }
+        self.observe_activity(pane_id, viewport)
+    }
+
+    fn observe_activity(&mut self, pane_id: u32, viewport: &[String]) -> bool {
+        let Some(running) = codex_activity(viewport) else {
+            return false;
+        };
+        if running {
+            self.recovered_running_panes.insert(pane_id);
+        } else if !self.recovered_running_panes.remove(&pane_id) {
+            return false;
+        }
+        let mut changed = false;
+        for agent in self
+            .agents
+            .values_mut()
+            .filter(|agent| agent.pane_id == Some(pane_id))
+        {
+            let status = if running {
+                Status::Running
+            } else {
+                Status::Done
+            };
+            changed |= agent.status != status;
+            agent.status = status;
+        }
+        changed
     }
 
     fn reconcile_live_panes(&mut self, live_pane_ids: &BTreeSet<u32>) -> bool {
@@ -518,20 +597,65 @@ impl App {
 }
 
 impl ZellijPlugin for App {
-    fn load(&mut self, _configuration: BTreeMap<String, String>) {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.dashboard_tab_id = configuration
+            .get("dashboard_tab_id")
+            .and_then(|value| value.parse().ok());
+        #[cfg(target_family = "wasm")]
+        match std::fs::read(report_cache_path()) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(agents) => self.agents = agents,
+                Err(error) => eprintln!("could not decode cached agent reports: {error}"),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("could not read cached agent reports: {error}"),
+        }
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::ReadCliPipes,
+            PermissionType::ReadPaneContents,
+            PermissionType::MessageAndLaunchOtherPlugins,
         ]);
-        subscribe(&[EventType::Key, EventType::PaneUpdate, EventType::TabUpdate]);
+        subscribe(&[
+            EventType::Key,
+            EventType::PaneUpdate,
+            EventType::TabUpdate,
+            EventType::PaneRenderReport,
+            EventType::Timer,
+        ]);
+        if self.dashboard_tab_id.is_none() {
+            set_timeout(0.1);
+        }
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
+            Event::Timer(_) => {
+                if let Ok(snapshot) = get_session_list() {
+                    if let Some(session) = snapshot
+                        .live_sessions
+                        .into_iter()
+                        .find(|session| session.is_current_session)
+                    {
+                        self.tabs = session.tabs;
+                        return self.update_pane_manifest(session.panes);
+                    }
+                }
+                false
+            }
             Event::Key(key) if key.bare_key == BareKey::Esc && key.key_modifiers.is_empty() => {
                 self.hide_dashboard();
                 false
+            }
+            Event::PaneRenderReport(panes) => {
+                let mut changed = false;
+                for (pane_id, contents) in panes {
+                    if let PaneId::Terminal(pane_id) = pane_id {
+                        changed |= self.observe_pane_contents(pane_id, &contents.viewport);
+                    }
+                }
+                changed | self.refresh_current_view()
             }
             Event::PaneUpdate(pane_manifest) => self.update_pane_manifest(pane_manifest),
             Event::TabUpdate(tabs) => {
@@ -543,10 +667,34 @@ impl ZellijPlugin for App {
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
+        #[cfg(target_family = "wasm")]
+        if let PipeSource::Cli(pipe_id) = &message.source {
+            unblock_cli_pipe_input(pipe_id);
+        }
+        #[cfg(target_family = "wasm")]
+        if message.name == "list_agents" {
+            if let PipeSource::Cli(pipe_id) = &message.source {
+                self.refresh_current_view();
+                if let Ok(payload) = serde_json::to_string(&self.agents) {
+                    cli_pipe_output(pipe_id, &format!("{payload}\n"));
+                }
+            }
+            return true;
+        }
         if message.name == SHOW_DASHBOARD_PIPE_NAME {
+            if matches!(message.source, PipeSource::Plugin(_)) {
+                if message.args.get("target_client_id")
+                    != Some(&get_plugin_ids().client_id.to_string())
+                {
+                    return false;
+                }
+                if let Some(payload) = &message.payload {
+                    if let Ok(agents) = serde_json::from_str(payload) {
+                        self.agents = agents;
+                    }
+                }
+            }
             self.show_dashboard();
-            #[cfg(target_family = "wasm")]
-            unblock_cli_pipe_input(&message.name);
             return true;
         }
         if message.name != PIPE_NAME {
@@ -563,14 +711,21 @@ impl ZellijPlugin for App {
                 self.apply_report(agent);
                 self.refresh_current_view();
                 self.error = None;
+                #[cfg(target_family = "wasm")]
+                if let Err(error) = serde_json::to_vec(&self.agents)
+                    .map_err(std::io::Error::other)
+                    .and_then(|bytes| {
+                        let path = report_cache_path();
+                        let temporary = format!("{path}.{}", get_plugin_ids().client_id);
+                        std::fs::write(&temporary, bytes)?;
+                        std::fs::rename(temporary, path)
+                    })
+                {
+                    eprintln!("could not cache agent reports: {error}");
+                }
             }
             Err(error) => self.error = Some(format!("invalid status report: {error}")),
         }
-        // CLI pipes are flow-controlled. Without this, Zellij never delivers
-        // the end-of-stream message and `zellij pipe` times out after one
-        // second, making lifecycle reports unreliable.
-        #[cfg(target_family = "wasm")]
-        unblock_cli_pipe_input(&message.name);
         true
     }
 
@@ -609,6 +764,38 @@ impl ZellijPlugin for App {
         println!();
         println!("Esc: hide dashboard");
     }
+}
+
+fn codex_activity(viewport: &[String]) -> Option<bool> {
+    let footer = viewport
+        .iter()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(6)
+        .map(|line| line.trim())
+        .collect::<Vec<_>>();
+    if footer
+        .iter()
+        .any(|line| line.starts_with('•') && line.contains("esc to interrupt"))
+    {
+        return Some(true);
+    }
+    // Only a recognizable Codex input footer can end recovered activity.
+    if footer
+        .first()
+        .is_some_and(|line| line.starts_with("gpt-") && line.contains(" · "))
+        && footer.iter().any(|line| line.starts_with('›'))
+    {
+        return Some(false);
+    }
+    None
+}
+
+#[cfg(target_family = "wasm")]
+fn report_cache_path() -> String {
+    // /data is client-specific. /cache survives client replacement; the server
+    // PID separates live sessions and avoids restoring reports after a restart.
+    format!("/cache/agent_reports_{}.json", get_plugin_ids().zellij_pid)
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -660,6 +847,58 @@ fn pane_rectangle(pane: &PaneInfo) -> PaneRectangle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_family = "wasm"))]
+    #[no_mangle]
+    extern "C" fn host_run_plugin_command() {
+        panic!("unit tests must not call the Zellij host");
+    }
+
+    #[test]
+    fn pane_updates_discover_agents_without_host_queries() {
+        let mut app = App::default();
+        app.tabs = vec![TabInfo {
+            tab_id: 4,
+            position: 2,
+            name: "worktree".into(),
+            active: true,
+            ..Default::default()
+        }];
+        let manifest = PaneManifest {
+            panes: std::collections::HashMap::from([(
+                2,
+                (0..64)
+                    .map(|id| PaneInfo {
+                        id,
+                        terminal_command: Some("zellij-codex-launch".into()),
+                        is_focused: id == 0,
+                        ..Default::default()
+                    })
+                    .collect(),
+            )]),
+        };
+        assert!(app.update_pane_manifest(manifest.clone()));
+        assert!(!app.update_pane_manifest(manifest));
+        assert_eq!(app.agents.len(), 64);
+    }
+
+    #[test]
+    fn recovers_activity_without_a_lifecycle_report() {
+        let mut app = App::default();
+        app.reconcile_discovered_panes(vec![(17, "coverage".into(), Some(4), 3)]);
+        let running = vec![
+            "• Waiting for background terminal (6m • esc to interrupt)".into(),
+            "  └ git status".into(),
+            "› Ask Codex to do anything".into(),
+            "gpt-6-astra low · ~/code/coverage".into(),
+        ];
+        assert!(app.observe_activity(17, &running));
+        assert_eq!(app.agents.values().next().unwrap().status, Status::Running);
+        assert!(!app.observe_activity(17, &["ordinary output".into()]));
+        assert!(app.observe_activity(17, &running[2..]));
+        assert_eq!(app.agents.values().next().unwrap().status, Status::Done);
+        assert_eq!(codex_activity(&["quoted esc to interrupt".into()]), None);
+    }
 
     #[test]
     fn parses_a_status_report() {
