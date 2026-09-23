@@ -36,7 +36,7 @@ pub fn render_tab(
         palette.ribbon_unselected.background
     };
     let background_color = if tab.active {
-        PaletteColor::Rgb((241, 243, 245))
+        palette.ribbon_selected.background
     } else if is_alternate_tab {
         alternate_tab_color
     } else {
@@ -44,33 +44,22 @@ pub fn render_tab(
     };
     let foreground_color = if tab.is_flashing_bell {
         if tab.active {
-            PaletteColor::Rgb((180, 35, 24))
+            palette.ribbon_selected.emphasis_3
         } else {
             palette.ribbon_unselected.emphasis_3
         }
     } else if tab.active {
-        PaletteColor::Rgb((32, 36, 43))
+        palette.ribbon_selected.base
     } else {
         palette.ribbon_unselected.base
     };
 
     let separator_fill_color = palette.text_unselected.background;
     let left_separator = style(separator_fill_color, background_color).paint(separator);
-    let (badge, name) = split_badge(&text, tab.active);
-    let base = style(foreground_color, background_color).bold();
-    let mut label = vec![base.paint(" ")];
-    let mut tab_text_len = name.width() + (separator_width * 2) + 2;
-    if let Some((symbol, color)) = badge {
-        label.push(
-            style(PaletteColor::Rgb(color), background_color)
-                .bold()
-                .paint(symbol),
-        );
-        label.push(base.paint(" "));
-        tab_text_len += symbol.width() + 1;
-    }
-    label.push(base.paint(format!("{} ", name)));
-    let tab_styled_text = ANSIStrings(&label).to_string();
+    let mut tab_text_len = text.width() + (separator_width * 2) + 2;
+    let tab_styled_text = style(foreground_color, background_color)
+        .bold()
+        .paint(format!(" {} ", text));
 
     let right_separator = style(background_color, separator_fill_color).paint(separator);
     let tab_styled_text = if !focused_clients.is_empty() {
@@ -102,77 +91,6 @@ pub fn render_tab(
         part: tab_styled_text,
         len: tab_text_len,
         tab_index: Some(tab.position),
-    }
-}
-
-type Badge = (&'static str, (u8, u8, u8));
-
-fn split_badge(name: &str, selected: bool) -> (Option<Badge>, &str) {
-    for (prefix, symbol, color, selected_color) in [
-        ("[🟠 ↻] ", "[↻]", (255, 165, 0), (154, 75, 0)),
-        ("[🔴 ↻] ", "[↻]", (255, 165, 0), (154, 75, 0)),
-        ("[🔴 !] ", "[!]", (255, 77, 77), (180, 35, 24)),
-        ("[🔵 ✓] ", "[✓]", (80, 160, 255), (23, 92, 211)),
-        ("[🟡 !] ", "[!]", (255, 210, 80), (128, 91, 0)),
-        ("[🔴 ✕] ", "[✕]", (255, 77, 77), (180, 35, 24)),
-        ("[🟡 Ⅱ] ", "[Ⅱ]", (255, 210, 80), (128, 91, 0)),
-    ] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            return (
-                Some((symbol, if selected { selected_color } else { color })),
-                rest,
-            );
-        }
-    }
-    (None, name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn badges_use_rgb_for_active_and_inactive_tabs() {
-        for active in [true, false] {
-            for (prefix, symbol, inactive_rgb, active_rgb) in [
-                ("[🟠 ↻] ", "[↻]", "255;165;0", "154;75;0"),
-                ("[🔴 !] ", "[!]", "255;77;77", "180;35;24"),
-                ("[🔵 ✓] ", "[✓]", "80;160;255", "23;92;211"),
-            ] {
-                let tab = TabInfo {
-                    active,
-                    ..Default::default()
-                };
-                let rendered = render_tab(
-                    format!("{prefix}project"),
-                    &tab,
-                    false,
-                    Styling::default(),
-                    "",
-                );
-                let rgb = if active { active_rgb } else { inactive_rgb };
-                assert!(rendered.part.contains(&format!("38;2;{rgb}")));
-                if active {
-                    assert!(rendered.part.contains("48;2;241;243;245"));
-                    assert!(rendered.part.contains("38;2;32;36;43"));
-                }
-                assert!(rendered.part.contains(symbol));
-                assert!(!rendered.part.contains(prefix));
-                assert_eq!(rendered.len, " [↻] project ".width());
-            }
-        }
-    }
-
-    #[test]
-    fn idle_names_and_click_positions_are_preserved() {
-        let tab = TabInfo {
-            position: 3,
-            ..Default::default()
-        };
-        let rendered = render_tab("project".into(), &tab, false, Styling::default(), "");
-        assert_eq!(rendered.len, 9);
-        assert_eq!(get_tab_to_focus(&[rendered], 1, 3), Some(4));
-        assert_eq!(split_badge("project", false), (None, "project"));
     }
 }
 
@@ -228,4 +146,20 @@ pub(crate) fn get_clicked_line_part(
         len += tab_line_part.len;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_names_and_click_positions_are_preserved() {
+        let tab = TabInfo {
+            position: 3,
+            ..Default::default()
+        };
+        let rendered = render_tab("project".into(), &tab, false, Styling::default(), "");
+        assert_eq!(rendered.len, 9);
+        assert_eq!(get_tab_to_focus(&[rendered], 1, 3), Some(4));
+    }
 }

@@ -27,7 +27,7 @@ def main() -> None:
         type=Path,
         default=Path(__file__).resolve().parents[1]
         / "target/wasm32-wasip1/release/zellij-codex-tab-bar.wasm",
-        help="Also verify explicit RGB rendering and live tab-bar replacement.",
+        help="Verify emoji rendering, theme colors, and live tab-bar replacement.",
     )
     parser.add_argument(
         "--installed-helper",
@@ -100,6 +100,8 @@ def main() -> None:
                 ):
                     break
                 assert time.monotonic() < deadline, panes
+            title_column = screen.display[0].index("Tab #1")
+            native_title_style = screen.buffer[0][title_column]
             pane = next(p for p in panes if not p["is_plugin"])
             pane_id, tab_id = pane["id"], pane["tab_id"]
             if args.tab_bar:
@@ -202,25 +204,12 @@ def main() -> None:
                 )
                 rendered = "\n".join(screen.display)
                 assert prefix + "Badge pane" in rendered, rendered
-                if args.tab_bar and prefix:
-                    symbol, color = {
-                        "[🟠 ↻] ": ("[↻]", "9a4b00"),
-                        "[🔴 !] ": ("[!]", "b42318"),
-                        "[🔵 ✓] ": ("[✓]", "175cd3"),
-                    }[prefix]
-                    row = screen.display[0]
-                    assert symbol + " Badge tab" in row, row
-                    column = row.index(symbol)
-                    assert screen.buffer[0][column].bg == "f1f3f5", row
-                    assert all(
-                        screen.buffer[0][column + i].fg == color
-                        for i in range(len(symbol))
-                    ), row
-                    assert screen.buffer[0][column + len(symbol) + 1].fg == "20242b", (
-                        row
-                    )
-                else:
-                    assert prefix + "Badge tab" in rendered, rendered
+                row = screen.display[0]
+                title = prefix + "Badge tab"
+                assert title in row, row
+                column = row.index(title)
+                assert screen.buffer[0][column].bg == native_title_style.bg, row
+                assert screen.buffer[0][column].fg == native_title_style.fg, row
                 rich.get_console().print(
                     f"PASS {event}: tab and pane {prefix or '(idle)'}"
                 )
@@ -337,6 +326,7 @@ def main() -> None:
                 while hook.poll() is None and time.monotonic() - started < 10:
                     _drain(child, stream, duration=0.05)
                 assert hook.wait(timeout=1) == 0
+                _drain(child, stream)
                 after = json.loads(
                     subprocess.check_output(
                         [*command, "list-panes", "--all", "--json"], env=env

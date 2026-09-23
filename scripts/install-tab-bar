@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the RGB badge renderer and optionally replace live native tab bars."""
+"""Install the emoji tab bar and optionally replace live native tab bars."""
 
 import argparse
 import hashlib
@@ -82,7 +82,7 @@ def main() -> None:
                     capture_output=True,
                     timeout=10,
                 )
-    print(f"RGB tab-bar installed: {plugin}")
+    print(f"Emoji tab-bar installed: {plugin}")
 
 
 def _write_with_backup(path: Path, text: str) -> None:

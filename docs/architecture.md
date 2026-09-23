@@ -10,9 +10,9 @@ the same name. Concurrent lifecycle reports share the lock; pane moves and
 closures are reconciled on the next report or explicit `--refresh`.
 
 The reporter prefixes native tab and pane names with status markers. The
-`zellij-codex-tab-bar` renderer replaces the tab marker with an RGB-colored ASCII
-badge, so tab colors do not depend on emoji font support. Native pane-header
-markers remain font-dependent. No pane background color, resident monitor, or
+`zellij-codex-tab-bar` renderer preserves the emoji markers and Zellij’s native
+theme styling. Both tab and pane-header emoji colors depend on the terminal’s
+color emoji font support. No pane background color, resident monitor, or
 pane-content subscription is needed. This trades continuous title tracking and focus-based acknowledgment
 for a process that exits after every update. Done persists until another
 lifecycle event or Alt+A acknowledgment; terminal OSC titles are overridden while a pane has a custom

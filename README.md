@@ -41,13 +41,13 @@ the launch wrapper; in other shells run `zellij-codex-launch` explicitly.
 | Versioned file | Installed destination / purpose |
 | --- | --- |
 | `config/zellij/config.kdl` | Zellij `config.kdl`: bindings, clipboard, shell, default layout |
-| `config/zellij/layouts/default.kdl` | Zellij `layouts/default.kdl`: white active tab with status badges |
+| `config/zellij/layouts/default.kdl` | Zellij `layouts/default.kdl`: theme-styled active tab with emoji status badges |
 | `config/zellij/workbench_keybinds.kdl` | Optional Alt+T and Ctrl+K bindings merged into `config.kdl` |
 | `config/workbench_layouts/*.kdl` | Optional workbench layouts: custom tab bar and automatic Codex pane titles |
 
 Ctrl+T, N explicitly loads the installed default layout. Every bundled layout
 loads the custom tab bar by its full `file:` URL, avoiding stale plugin aliases in
-existing sessions. This makes the white active-tab background consistent across
+existing sessions. This keeps the theme styling and emoji badges consistent across
 ordinary tabs and workbench tabs. Alt+A acknowledges only the selected done pane;
 Ctrl+Tab and Ctrl+Shift+Tab switch tabs.
 
@@ -111,12 +111,10 @@ The short-lived reporter runs only when a Codex lifecycle hook fires.
 | Waiting for input or approval | `[🔴 !]` |
 | Done | `[🔵 ✓]` |
 
-Badges appear beside the existing tab and pane names. The optional RGB tab bar
-draws orange `[↻]`, red `[!]`, and blue `[✓]` labels with explicit terminal colors.
-The selected tab has a near-white background, dark text, and darker badge shades
-for contrast; other tabs retain their theme colors. Native pane headers use Unicode
-markers, whose color depends on the terminal's emoji font. A tab summarizes its
-agents, prioritizing input, error, stuck, done, running, paused, then idle.
+Badges appear beside the existing tab and pane names. The custom tab bar retains
+Zellij's native theme colors and displays the same Unicode emoji markers as pane
+headers. Emoji colors depend on the terminal's color emoji font support.
+A tab summarizes its agents, prioritizing input, error, stuck, done, running, paused, then idle.
 `PreToolUse` detects `request_user_input`; `PermissionRequest` detects approvals;
 `PostToolUse` resumes running. Alt+A clears the completed badge only on the selected pane. The tab keeps its
 done badge until the last completed pane is cleared; running/input badges remain.
@@ -140,7 +138,7 @@ configuration, and stop existing dashboard/monitor instances with
 `zellij pipe --name stop_dashboard -- ''` (requires the current WASM build).
 Badge hooks never launch that plugin.
 
-For reliable tab badge colors, build and install the tab-bar renderer:
+For emoji tab badges with pane-specific Alt+A clearing, build and install the tab bar:
 
 ```sh
 cargo build --release --target wasm32-wasip1 --bin zellij-codex-tab-bar
@@ -160,7 +158,7 @@ MIT-licensed `default-plugins/tab-bar` (license included in that directory).
 It reacts to tab updates; it neither monitors Codex processes nor opens the
 legacy dashboard.
 
-Bind Alt+A to acknowledge completed work through the RGB tab bar:
+Bind Alt+A to acknowledge completed work through the custom tab bar:
 
 ```kdl
 keybinds {
@@ -388,6 +386,7 @@ uv run scripts/check_badges.py --installed-helper \
 ```
 
 The live check uses a disposable Zellij session and verifies lifecycle updates,
-RGB tab colors, mixed done/running panes, and Alt+A without changing pane focus.
+emoji badges and native theme colors, mixed done/running panes, and Alt+A without
+changing pane focus.
 The installation tests render configs under temporary paths, including paths
 with spaces, validate them with Zellij, and check that backups survive reruns.
