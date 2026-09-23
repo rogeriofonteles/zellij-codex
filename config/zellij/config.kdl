@@ -1,0 +1,29 @@
+plugins {
+    tab-bar location=__TAB_BAR_PLUGIN__
+__WORKTREE_ALIAS__
+}
+
+keybinds {
+    tab {
+        bind "n" {
+            NewTab {
+                layout __DEFAULT_LAYOUT__
+            }
+            SwitchToMode "Normal"
+        }
+    }
+    shared_except "locked" {
+        bind "Alt a" {
+            MessagePlugin {
+                name "zellij_codex_clear_done"
+            }
+        }
+        bind "Ctrl Tab" { GoToNextTab; }
+        bind "Ctrl Shift Tab" { GoToPreviousTab; }
+    }
+__WORKBENCH_BINDINGS__
+}
+copy_on_select true
+copy_clipboard "system"
+default_shell __DEFAULT_SHELL__
+default_layout __DEFAULT_LAYOUT__

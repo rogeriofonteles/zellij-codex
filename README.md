@@ -1,15 +1,186 @@
 # zellij-codex
 
-A Zellij WASM plugin for collecting and displaying Codex agent status.
+Codex status badges for Zellij tabs and pane titles, with an optional legacy
+WASM dashboard.
 
-## Requirements
+## Reproduce this setup on another machine
+
+The configuration is versioned here, including the changes that otherwise live
+in `~/.config/zellij` and the Neovim workbench checkout. Templates use placeholders
+instead of a particular username or checkout path. Run the installer on each
+machine; copying an already-rendered `config.kdl` retains that machine's paths.
+
+Requirements: Zellij 0.44.3 (the tested plugin API), a Rust toolchain with the
+`wasm32-wasip1` target, Python 3.11+, and a Codex CLI with lifecycle hooks enabled.
+The scripts target Linux/macOS, or WSL on Windows. Put `~/.local/bin` on `PATH`.
+
+```sh
+git clone https://github.com/rogeriofonteles/zellij-codex.git
+cd zellij-codex
+rustup target add wasm32-wasip1
+cargo build --locked --release --target wasm32-wasip1
+./scripts/install
+./scripts/install-tab-bar
+./scripts/install-zellij-config
+zellij setup --check
+```
+
+`install-zellij-config` **replaces your Zellij configuration** with this setup.
+It saves each original file beside it as `NAME.before-zellij-codex` before the
+first replacement; rerunning it preserves that backup. It uses `$XDG_CONFIG_HOME`
+or `~/.config`, resolves local paths, and selects fish when available, otherwise
+`$SHELL`. Pass `--shell /path/to/shell` to choose a shell explicitly. The other
+installers merge Codex hooks and install helpers; credentials, trust decisions,
+session state, and compiled plugins are not copied from another machine.
+
+Start a new Zellij session for the complete setup. Review and allow the tab-bar
+plugin's permissions (read state, change state, run commands), then start Codex
+and review its hooks with `/hooks`. The installed fish `codex` function uses
+the launch wrapper; in other shells run `zellij-codex-launch` explicitly.
+
+| Versioned file | Installed destination / purpose |
+| --- | --- |
+| `config/zellij/config.kdl` | Zellij `config.kdl`: bindings, clipboard, shell, default layout |
+| `config/zellij/layouts/default.kdl` | Zellij `layouts/default.kdl`: white active tab with status badges |
+| `config/zellij/workbench_keybinds.kdl` | Optional Alt+T and Ctrl+K bindings merged into `config.kdl` |
+| `config/workbench_layouts/*.kdl` | Optional workbench layouts: custom tab bar and automatic Codex pane titles |
+
+Ctrl+T, N explicitly loads the installed default layout. Every bundled layout
+loads the custom tab bar by its full `file:` URL, avoiding stale plugin aliases in
+existing sessions. This makes the white active-tab background consistent across
+ordinary tabs and workbench tabs. Alt+A acknowledges only the selected done pane;
+Ctrl+Tab and Ctrl+Shift+Tab switch tabs.
+
+### Optional Neovim and worktree integration
+
+Alt+T and Ctrl+K require the separate
+[Neovim workbench](https://github.com/rogeriofonteles/nvim-zellij-workbench) and
+[worktree plugin fork](https://github.com/rogeriofonteles/zellij-worktree).
+Follow the workbench's requirements for Neovim and its tools. For sibling checkouts:
+
+```sh
+git clone https://github.com/rogeriofonteles/nvim-zellij-workbench.git ../nvim-zellij-workbench
+git clone https://github.com/rogeriofonteles/zellij-worktree.git ../zellij-worktree
+(cd ../zellij-worktree && cargo build --release --target wasm32-wasip1)
+./scripts/install-zellij-config \
+  --workbench-root ../nvim-zellij-workbench \
+  --worktree-plugin ../zellij-worktree/target/wasm32-wasip1/release/zellij-worktree.wasm
+```
+
+The installer copies the worktree plugin and renders the three bundled workbench
+layouts into that checkout, backing up existing layouts. Alt+T types the workbench
+launch command into the focused shell, so use it at a shell prompt. Ctrl+K opens
+the worktree picker. Neither requires the checkouts to live at a fixed path.
+Workbench panes have no fixed `Codex` name, allowing Codex's conversation title
+to appear when no custom pane name overrides it.
+
+To upgrade, pull this repository, rebuild, and rerun the same installer commands,
+including the optional workbench arguments if used. To update native tab bars in
+an existing session without restarting terminals, run
+`./scripts/install-tab-bar --session SESSION`. The Ctrl+T, N binding reloads with
+the config; the session's other default-layout settings take effect after restart.
+
+## Status badges (default)
+
+Run `./scripts/install`, then start a new Codex conversation and review its
+updated hooks. No resident monitor, polling, or dashboard is needed.
+The short-lived reporter runs only when a Codex lifecycle hook fires.
+
+| State | Badge |
+| --- | --- |
+| Idle | Original title, no badge |
+| Running | `[🟠 ↻]` |
+| Waiting for input or approval | `[🔴 !]` |
+| Done | `[🔵 ✓]` |
+
+Badges appear beside the existing tab and pane names. The optional RGB tab bar
+draws orange `[↻]`, red `[!]`, and blue `[✓]` labels with explicit terminal colors.
+The selected tab has a near-white background, dark text, and darker badge shades
+for contrast; other tabs retain their theme colors. Native pane headers use Unicode
+markers, whose color depends on the terminal's emoji font. A tab summarizes its
+agents, prioritizing input, error, stuck, done, running, paused, then idle.
+`PreToolUse` detects `request_user_input`; `PermissionRequest` detects approvals;
+`PostToolUse` resumes running. Alt+A clears the completed badge only on the selected pane. The tab keeps its
+done badge until the last completed pane is cleared; running/input badges remain.
+One done pane plus one running pane shows done. A new prompt immediately marks
+its pane running; if no done panes remain, the tab shows running. Clearing the
+last done pane with Alt+A also reveals another pane's running status.
+Done also clears on the next
+prompt, session start, or session end. Plain-text questions without an input-tool event
+appear as done when the turn ends.
+
+The reporter decorates Zellij titles through its native rename commands. Title
+changes made by the user are retained on the next report. While decorated,
+terminal-generated OSC titles are overridden by the pane name. Closing or moving
+a pane is reconciled at the next lifecycle report, or immediately with
+`~/.local/bin/zellij-codex-badges --refresh`. State is isolated by the session
+socket identity and updates are serialized across simultaneous hooks.
+
+To disable the legacy dashboard, remove its Alt+A `MessagePlugin` binding and
+the `zellij-codex.wasm` entry with `role "monitor"` from Zellij's `load_plugins`
+configuration, and stop existing dashboard/monitor instances with
+`zellij pipe --name stop_dashboard -- ''` (requires the current WASM build).
+Badge hooks never launch that plugin.
+
+For reliable tab badge colors, build and install the tab-bar renderer:
+
+```sh
+cargo build --release --target wasm32-wasip1 --bin zellij-codex-tab-bar
+./scripts/install-tab-bar
+```
+
+The portable installer above writes direct plugin URLs into its layouts.
+For other layouts, pass `--layout /path/to/layout.kdl` to replace `tab-bar` or
+`zellij:tab-bar` references with the installed plugin's full URL.
+After granting the plugin read-state, tab-navigation, and run-command permissions, use
+`./scripts/install-tab-bar --session SESSION` to replace existing native tab bars
+without restarting terminal processes. Alt+A continues to clear completed work.
+
+The renderer preserves Zellij 0.44.3's native tab-bar layout, scrolling, and mouse
+navigation. Its source in `src/tab_bar` is adapted from Zellij's
+MIT-licensed `default-plugins/tab-bar` (license included in that directory).
+It reacts to tab updates; it neither monitors Codex processes nor opens the
+legacy dashboard.
+
+Bind Alt+A to acknowledge completed work through the RGB tab bar:
+
+```kdl
+keybinds {
+    shared_except "locked" {
+        bind "Alt a" {
+            MessagePlugin {
+                name "zellij_codex_clear_done"
+            }
+        }
+    }
+}
+```
+
+The tab bar runs the installed helper without opening a pane or changing focus.
+Grant its RunCommands permission when prompted. Only the selected pane’s completed badge is cleared; the tab badge is
+recomputed from all remaining pane statuses. From a shell, `zellij-codex-badges --clear-done` performs
+the same action without requiring the custom tab bar.
+
+Manual report from a Zellij pane:
+
+```sh
+./scripts/report-status running
+./scripts/report-status input
+./scripts/report-status done
+./scripts/report-status idle
+```
+
+Use `--session NAME --pane-id ID` to target another pane. The existing WASM
+dashboard remains available explicitly through `--plugin /path/to/plugin.wasm`.
+
+## Legacy dashboard requirements
 
 - Zellij 0.44.3 or a compatible release
 - Rust 1.81 or newer
 - Codex CLI 0.147.0 or a hook-compatible release
 - Python 3 for the lifecycle reporter
 
-## Install
+## Optional legacy dashboard build
 
 Clone the repository, build the WASM plugin, and run the installer:
 
@@ -25,10 +196,11 @@ cargo build --release --target wasm32-wasip1
 
 The installer copies the plugin to Zellij's user configuration directory,
 installs the lifecycle and launch reporters in `~/.local/bin`, installs a fish
-`codex` function, and merges five lifecycle handlers into
+`codex` function, and merges lifecycle handlers into
 `~/.codex/hooks.json` without replacing unrelated hooks. The launch reporter
 makes a pane visible immediately, before Codex creates its conversation ID;
-subsequent lifecycle hooks update that same pane row.
+subsequent lifecycle hooks update that pane's native badge. Automatic hooks now
+target badges; the legacy dashboard can still receive explicit pipe reports.
 
 The dashboard also discovers Codex processes from Zellij's live pane list, so
 workbench-created panes appear even if they bypass the launch reporter. A
@@ -170,7 +342,7 @@ zellij action list-panes
 zellij action close-pane --pane-id plugin_ID
 ```
 
-## Scope
+## Legacy dashboard scope
 
 Implemented now:
 
@@ -184,7 +356,20 @@ Implemented now:
 - pane and tab tracking for a workbench-aware floating overlay;
 - a manual producer for testing.
 
-Deliberately deferred until this transport is proven inside Zellij:
+Expiry and heartbeat semantics remain outside the legacy dashboard's scope.
 
-- persistence, expiry/heartbeat semantics, and navigation;
-- tab-bar integration.
+## Validation
+
+```sh
+cargo test --all-targets
+cargo fmt --check
+uv run --with pytest pytest -q tests
+uv run scripts/check_badges.py --installed-helper \
+  --tab-bar "${XDG_CONFIG_HOME:-$HOME/.config}/zellij/plugins/zellij-codex-tab-bar.wasm" \
+  --cache-home "${XDG_CACHE_HOME:-$HOME/.cache}"
+```
+
+The live check uses a disposable Zellij session and verifies lifecycle updates,
+RGB tab colors, mixed done/running panes, and Alt+A without changing pane focus.
+The installation tests render configs under temporary paths, including paths
+with spaces, validate them with Zellij, and check that backups survive reruns.

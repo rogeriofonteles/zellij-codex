@@ -9,7 +9,11 @@ import tempfile
 from pathlib import Path
 
 
-def status_for(event: str) -> str:
+def status_for(event: str, payload: dict | None = None) -> str:
+    if event == "PreToolUse" and "request_user_input" in str(
+        (payload or {}).get("tool_name", "")
+    ):
+        return "input"
     return {
         "SessionStart": "idle",
         "UserPromptSubmit": "running",
@@ -207,7 +211,9 @@ def main() -> int:
             else session_id
         ),
         "agent": f"codex-{pane}" if pane else f"codex-{session_id[:8]}",
-        "status": status_for(event),
+        "status": status_for(event, payload),
+        "event": event,
+        "tool_name": str(payload.get("tool_name", "")),
         "task": task_for(event, payload),
         "worktree": cwd.name,
         "pane_id": int(pane) if pane.isdigit() else None,
@@ -215,29 +221,17 @@ def main() -> int:
         "tab_position": tab_position,
         "remove": event == "SessionEnd",
     }
-    plugin = os.environ.get("ZELLIJ_CODEX_PLUGIN") or str(
-        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-        / "zellij/plugins/zellij-codex.wasm"
-    )
-    command = ["zellij"]
-    if zellij_session:
-        command.extend(["--session", zellij_session])
-    command.extend(
-        [
-            "pipe",
-            "--plugin",
-            f"file:{plugin}",
-            "--name",
-            "codex_status",
-            "--",
-            json.dumps(report, separators=(",", ":")),
-        ]
-    )
+    reporter = Path(__file__).with_name("codex-badges")
+    if not reporter.exists():
+        reporter = Path(__file__).with_name("zellij-codex-badges")
+    command = [sys.executable, str(reporter), "--session", zellij_session]
     try:
         subprocess.run(
             command,
+            input=json.dumps(report),
+            text=True,
             check=False,
-            timeout=2,
+            timeout=5,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

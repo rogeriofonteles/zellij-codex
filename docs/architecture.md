@@ -1,5 +1,38 @@
 # Minimal architecture
 
+## Default native badges
+
+`codex-hook` and `codex-launch` now invoke the short-lived `codex-badges`
+reporter instead of launching the WASM dashboard. It locks a session-scoped
+cache, reads live pane locations, and renames only titles whose badge changed.
+The session socket identity prevents stale state from a previous session with
+the same name. Concurrent lifecycle reports share the lock; pane moves and
+closures are reconciled on the next report or explicit `--refresh`.
+
+The reporter prefixes native tab and pane names with status markers. The
+`zellij-codex-tab-bar` renderer replaces the tab marker with an RGB-colored ASCII
+badge, so tab colors do not depend on emoji font support. Native pane-header
+markers remain font-dependent. No pane background color, resident monitor, or
+pane-content subscription is needed. This trades continuous title tracking and focus-based acknowledgment
+for a process that exits after every update. Done persists until another
+lifecycle event or Alt+A acknowledgment; terminal OSC titles are overridden while a pane has a custom
+name. The legacy dashboard below remains optional and is not launched by hooks.
+
+Alt+A broadcasts `zellij_codex_clear_done` to existing plugins. The tab bar in
+the active tab invokes the reporter through `run_command`, passing the session
+and selected terminal pane ID, captured before launching the helper. This requires
+RunCommands permission and creates no terminal pane. Only that pane’s done state
+is cleared; the tab is recomputed from all panes. Running and input states are preserved.
+Tab priority is input, error, stuck, done, running, paused, idle. New prompts
+replace that pane's done state with running; acknowledging the last done pane
+reveals any remaining running state.
+
+Portable configuration templates live in `config/`. `install-zellij-config`
+renders machine-specific paths, writes the default layout and explicit new-tab
+binding, and optionally installs the workbench layouts. All layouts use the
+custom tab-bar file URL directly; they do not rely on aliases being reloaded
+inside an existing Zellij session. See the README for installation and backups.
+
 ## First vertical slice
 
 ```text
@@ -54,10 +87,8 @@ did not expose a page documenting these current lifecycle hooks.
 - `focus_pane_with_id` / `focus_terminal_pane` and tab-switching commands cover
   later dashboard navigation.
 - Pane and tab update subscriptions can keep a future registry synchronized.
-- Plugins can rename tabs, but directly owning the user's tab name is likely the
-  wrong tab-status integration. A dedicated custom tab-bar plugin (or status-bar
-  presentation) should consume the aggregate state without destroying worktree
-  names.
+- Native badges prefix the existing tab name using stable tab IDs. A future
+  custom tab bar could keep status metadata entirely separate from names.
 
 ## Main uncertainties to resolve next
 

@@ -1,0 +1,22 @@
+layout {
+    tab name=__WORKBENCH_TAB_NAME__ focus=true hide_floating_panes=true {
+        pane size=1 borderless=true {
+            plugin location=__TAB_BAR_PLUGIN__
+        }
+        pane split_direction="vertical" {
+            pane size="50%" focus=true name="Git / Shell"
+            pane size="50%" command="env" {
+                args __ZELLIJ_SOCKET_ENV_ARG__ "bash" "-lc" "unset NO_COLOR; if [[ ${TERM:-} == screen ]] && infocmp screen-256color >/dev/null 2>&1; then export TERM=screen-256color; fi; export COLORTERM=${COLORTERM:-truecolor}; if command -v zellij-codex-launch >/dev/null 2>&1; then exec zellij-codex-launch --yolo; else exec codex --yolo; fi"
+            }
+        }
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+        floating_panes {
+            pane x="0%" y=1 width="100%" height="98%" command=__NVIM_WORKBENCH_COMMAND__ {
+                args "."
+                name "Neovim"
+            }
+        }
+    }
+}

@@ -7,8 +7,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 
 def pane_context(cwd: Path) -> tuple[str, int | None, int | None]:
@@ -228,10 +229,6 @@ def report_launch(pane: str, tab_id: int | None, tab_position: int | None) -> No
     if not pane:
         return
     session = os.environ.get("ZELLIJ_SESSION_NAME", "")
-    plugin = (
-        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-        / "zellij/plugins/zellij-codex.wasm"
-    )
     payload = {
         "id": f"{session}:pane:{pane}" if session else f"pane:{pane}",
         "agent": f"codex-{pane}",
@@ -242,20 +239,16 @@ def report_launch(pane: str, tab_id: int | None, tab_position: int | None) -> No
         "tab_id": tab_id,
         "tab_position": tab_position,
     }
+    reporter = Path(__file__).with_name("codex-badges")
+    if not reporter.exists():
+        reporter = Path(__file__).with_name("zellij-codex-badges")
     try:
         subprocess.run(
-            [
-                "zellij",
-                "pipe",
-                "--plugin",
-                f"file:{plugin}",
-                "--name",
-                "codex_status",
-                "--",
-                json.dumps(payload, separators=(",", ":")),
-            ],
+            [sys.executable, str(reporter), "--session", session],
+            input=json.dumps(payload),
+            text=True,
             check=False,
-            timeout=2,
+            timeout=5,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

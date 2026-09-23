@@ -1,0 +1,14 @@
+    shared_except "locked" "tab" {
+        bind "Ctrl k" {
+            LaunchOrFocusPlugin __WORKTREE_PLUGIN__ {
+                floating true
+                workbench_command __WORKBENCH_COMMAND__
+            }
+        }
+    }
+    shared_except "locked" {
+        bind "Alt t" {
+            WriteChars __WORKBENCH_SHELL_COMMAND__
+            Write 13
+        }
+    }

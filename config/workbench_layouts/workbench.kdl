@@ -1,0 +1,14 @@
+layout {
+    tab name=__WORKBENCH_TAB_NAME__ focus=true {
+        pane size=1 borderless=true {
+            plugin location=__TAB_BAR_PLUGIN__
+        }
+        pane focus=true command=__NVIM_WORKBENCH_COMMAND__ {
+            args "."
+            name "Neovim"
+        }
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+}

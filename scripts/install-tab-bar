@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Install the RGB badge renderer and optionally replace live native tab bars."""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--layout",
+        type=Path,
+        action="append",
+        default=[],
+        help="Use the installed tab-bar plugin directly in this layout.",
+    )
+    parser.add_argument(
+        "--session",
+        help="Replace native tab bars in this live session after granting plugin permissions.",
+    )
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parents[1]
+    source = root / "target/wasm32-wasip1/release/zellij-codex-tab-bar.wasm"
+    if not source.is_file():
+        raise SystemExit(
+            "Build with cargo build --release --target wasm32-wasip1 --bin zellij-codex-tab-bar first."
+        )
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    plugin = config_home / "zellij/plugins/zellij-codex-tab-bar.wasm"
+    plugin.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, plugin)
+    config = config_home / "zellij/config.kdl"
+    text = config.read_text() if config.exists() else ""
+    alias = f"    tab-bar location={json.dumps('file:' + str(plugin))}"
+    existing = re.search(r'^\s*tab-bar\s+location="([^"]+)"[^\n]*', text, re.MULTILINE)
+    if existing:
+        if existing.group(1) not in ("zellij:tab-bar", "file:" + str(plugin)):
+            raise SystemExit(
+                "A different custom tab-bar alias exists; update it explicitly before installing."
+            )
+        text = text[: existing.start()] + "\n" + alias + text[existing.end() :]
+    elif "plugins {" in text:
+        text = text.replace("plugins {", "plugins {\n" + alias, 1)
+    else:
+        text += "\nplugins {\n" + alias + "\n}\n"
+    _write_with_backup(config, text)
+    for layout in args.layout:
+        _write_with_backup(
+            layout,
+            re.sub(
+                r'plugin location="(?:zellij:)?tab-bar"',
+                lambda _: 'plugin location=' + json.dumps('file:' + str(plugin)),
+                layout.read_text(),
+            ),
+        )
+    if args.session:
+        command = ["zellij", "--session", args.session, "action"]
+        panes = json.loads(
+            subprocess.check_output(
+                [*command, "list-panes", "--all", "--json"], text=True, timeout=5
+            )
+        )
+        for pane in panes:
+            if pane.get("plugin_url") in ("tab-bar", "zellij:tab-bar"):
+                subprocess.run(
+                    [
+                        *command,
+                        "launch-plugin",
+                        "--tab-id",
+                        str(pane["tab_id"]),
+                        "--configuration",
+                        f"replace_pane_id={pane['id']}",
+                        "file:" + str(plugin),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+    print(f"RGB tab-bar installed: {plugin}")
+
+
+def _write_with_backup(path: Path, text: str) -> None:
+    if path.exists() and path.read_text() == text:
+        return
+    backup_dir = (
+        Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+        / "zellij-codex/backups"
+    )
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    identity = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:12]
+    backup = backup_dir / f"{path.name}.{identity}"
+    if path.exists() and not backup.exists():
+        shutil.copy2(path, backup)
+    path.write_text(text)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Install the portable Zellij config, backing up files before replacing them."""
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+from pathlib import Path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--shell", help="Shell executable (defaults to fish, then $SHELL)."
+    )
+    parser.add_argument(
+        "--workbench-root", type=Path, help="Optional nvim-zellij-workbench checkout."
+    )
+    parser.add_argument(
+        "--worktree-plugin",
+        type=Path,
+        help="Built zellij-worktree.wasm; requires --workbench-root.",
+    )
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parents[1]
+    templates = root / "config/zellij"
+    config_dir = (
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        .expanduser()
+        .resolve()
+        / "zellij"
+    )
+    plugin = config_dir / "plugins/zellij-codex-tab-bar.wasm"
+    if not plugin.is_file():
+        parser.error("Run scripts/install-tab-bar before installing the Zellij config.")
+    shell = shutil.which(args.shell or "fish")
+    if not shell and not args.shell:
+        shell = shutil.which(os.environ.get("SHELL", "sh"))
+    if not shell:
+        parser.error("Shell executable not found; pass --shell /path/to/shell.")
+    values = {
+        "__TAB_BAR_PLUGIN__": json.dumps("file:" + str(plugin)),
+        "__DEFAULT_LAYOUT__": json.dumps(str(config_dir / "layouts/default.kdl")),
+        "__DEFAULT_SHELL__": json.dumps(shell),
+        "__WORKTREE_ALIAS__": "",
+        "__WORKBENCH_BINDINGS__": "",
+    }
+    files: dict[Path, str] = {}
+    worktree_copy: tuple[Path, Path] | None = None
+    if args.worktree_plugin and not args.workbench_root:
+        parser.error("--worktree-plugin requires --workbench-root.")
+    if args.workbench_root:
+        workbench = args.workbench_root.expanduser().resolve()
+        for name in ("surface-workbench", "nvim-workbench"):
+            if not os.access(workbench / "bin" / name, os.X_OK):
+                parser.error(f"Missing executable: {workbench / 'bin' / name}")
+        worktree_target = config_dir / "plugins/zellij-worktree.wasm"
+        worktree_source = (
+            (args.worktree_plugin or worktree_target).expanduser().resolve()
+        )
+        if not worktree_source.is_file():
+            parser.error(
+                "Build zellij-worktree and pass --worktree-plugin /path/to/zellij-worktree.wasm."
+            )
+        if worktree_source != worktree_target:
+            worktree_copy = (worktree_source, worktree_target)
+        command = str(workbench / "bin/surface-workbench")
+        values.update(
+            {
+                "__WORKTREE_PLUGIN__": json.dumps("file:" + str(worktree_target)),
+                "__WORKBENCH_COMMAND__": json.dumps(command),
+                "__WORKBENCH_SHELL_COMMAND__": json.dumps(
+                    shlex.quote(command) + ' "$PWD"'
+                ),
+            }
+        )
+        values["__WORKTREE_ALIAS__"] = (
+            "    worktree location=" + values["__WORKTREE_PLUGIN__"]
+        )
+        values["__WORKBENCH_BINDINGS__"] = _render(
+            templates / "workbench_keybinds.kdl", values
+        ).rstrip()
+        for layout in (root / "config/workbench_layouts").glob("*.kdl"):
+            files[workbench / "layouts" / layout.name] = _render(layout, values)
+    files[config_dir / "layouts/default.kdl"] = _render(
+        templates / "layouts/default.kdl", values
+    )
+    files[config_dir / "config.kdl"] = _render(templates / "config.kdl", values)
+    if worktree_copy:
+        source, destination = worktree_copy
+        _backup(destination)
+        shutil.copy2(source, destination)
+    for path, content in files.items():
+        if path.exists() and path.read_text() == content:
+            continue
+        _backup(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+
+def _render(template: Path, values: dict[str, str]) -> str:
+    content = template.read_text()
+    for placeholder, value in values.items():
+        content = content.replace(placeholder, value)
+    return content
+
+
+def _backup(path: Path) -> None:
+    backup = path.with_name(path.name + ".before-zellij-codex")
+    if path.exists() and not backup.exists():
+        shutil.copy2(path, backup)
+
+
+if __name__ == "__main__":
+    main()

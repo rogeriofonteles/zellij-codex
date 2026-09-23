@@ -1,12 +1,14 @@
 //! Zellij plugin entry point for the Codex status dashboard.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use zellij_tile::prelude::*;
 
 const PIPE_NAME: &str = "codex_status";
 const SHOW_DASHBOARD_PIPE_NAME: &str = "show_dashboard";
+const SYNC_AGENTS_PIPE_NAME: &str = "sync_agents";
+const AGENT_SNAPSHOT_PIPE_NAME: &str = "agent_snapshot";
 const DASHBOARD_PANE_TITLE: &str = "Codex Dashboard";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -89,6 +91,26 @@ struct App {
     visible_floating_pane: Option<FloatingPaneState>,
     suppressed_floating_panes: Vec<FloatingPaneState>,
     pending_floating_pane_suppression: Option<PendingFloatingPaneSuppression>,
+    checkpoint_pending: bool,
+    bootstrap_pending: bool,
+    dashboard_named: bool,
+    dashboard_visible: bool,
+    plugin_id: Option<u32>,
+    status_source: Option<u32>,
+    pending_reports: Vec<PipeMessage>,
+    seen_reports: VecDeque<(String, String)>,
+    plugin_url: Option<String>,
+    status_observers: BTreeSet<u32>,
+    last_published: Option<AgentSnapshot>,
+    published_peers: BTreeSet<u32>,
+    is_monitor: bool,
+    monitor_start_pending: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct AgentSnapshot {
+    agents: BTreeMap<String, AgentReport>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -138,7 +160,10 @@ impl App {
                     .retain(|_, existing| existing.pane_id != Some(pane_id));
             }
         } else {
-            if agent.status == Status::Done && agent.pane_id == self.focused_pane_id {
+            if agent.status == Status::Done
+                && agent.pane_id.is_some()
+                && agent.pane_id == self.focused_pane_id
+            {
                 agent.status = Status::Idle;
             }
             if let Some(pane_id) = agent.pane_id {
@@ -154,7 +179,13 @@ impl App {
             self.error = Some("could not determine the focused Zellij pane".to_string());
             return;
         };
-        let Some(tab) = get_tab_info(tab_id) else {
+        let Some(tab) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .cloned()
+            .or_else(|| get_tab_info(tab_id))
+        else {
             return;
         };
         let tab_position = tab.position;
@@ -171,19 +202,38 @@ impl App {
                     ("dashboard_tab_id".to_string(), tab_id.to_string()),
                     ("caller_cwd".to_string(), ".".to_string()),
                 ]))
-                .with_payload(serde_json::to_string(&self.agents).unwrap())
                 .with_args(BTreeMap::from([(
                     "target_client_id".to_string(),
                     get_plugin_ids().client_id.to_string(),
                 )]))
-                .new_plugin_instance_should_float(true);
+                .new_plugin_instance_should_float(true)
+                .new_plugin_instance_should_have_pane_title(DASHBOARD_PANE_TITLE);
+            if let Some(id) = self.dashboard_in_tab(tab_position) {
+                message.plugin_url = None;
+                message.destination_plugin_id = Some(id);
+            }
             if let Some(args) = message.new_plugin_args.as_mut() {
                 args.should_focus = Some(false);
+            }
+            if message.destination_plugin_id.is_none() {
+                message.message_payload = Some(
+                    serde_json::to_string(&AgentSnapshot {
+                        agents: self.agents.clone(),
+                        error: self.error.clone(),
+                    })
+                    .unwrap(),
+                );
+            }
+            if let Some(source) = self.status_source {
+                message
+                    .message_args
+                    .insert("status_source".into(), source.to_string());
             }
             pipe_message_to_plugin(message);
             return;
         }
-        self.refresh_agents();
+        self.dashboard_visible = true;
+        // Status snapshots arrive in the background; opening only displays the cache.
         if focused_pane_id == PaneId::Plugin(get_plugin_ids().plugin_id) {
             self.center_dashboard();
             return;
@@ -193,7 +243,6 @@ impl App {
         let codex_surface_is_visible = focused_pane_info
             .as_ref()
             .is_some_and(|pane| !pane.is_floating && !pane.is_suppressed);
-        self.observe_current_view(tab_position, focused_pane_id, codex_surface_is_visible);
         self.visible_floating_pane = focused_pane_info
             .filter(|pane| pane.is_floating && !pane.is_suppressed)
             .map(|pane| FloatingPaneState {
@@ -216,14 +265,17 @@ impl App {
             });
         }
 
-        rename_plugin_pane(get_plugin_ids().plugin_id, DASHBOARD_PANE_TITLE);
+        if !self.dashboard_named {
+            rename_plugin_pane(get_plugin_ids().plugin_id, DASHBOARD_PANE_TITLE);
+            self.dashboard_named = true;
+        }
         self.suppress_floating_panes(panes_to_suppress);
         show_self(true);
         self.center_dashboard();
-        focus_pane_with_id(PaneId::Plugin(get_plugin_ids().plugin_id), true, true);
     }
 
     fn hide_dashboard(&mut self) {
+        self.dashboard_visible = false;
         self.pending_floating_pane_suppression = None;
         hide_self();
         if let Some(pane) = self.visible_floating_pane.take() {
@@ -320,6 +372,21 @@ impl App {
             .collect()
     }
 
+    fn dashboard_in_tab(&self, tab_position: usize) -> Option<u32> {
+        self.pane_manifest
+            .panes
+            .get(&tab_position)?
+            .iter()
+            .filter(|pane| {
+                pane.is_plugin
+                    && !pane.exited
+                    && pane.plugin_url == self.plugin_url
+                    && Some(pane.id) != self.status_source
+            })
+            .map(|pane| pane.id)
+            .min()
+    }
+
     fn plugin_tab_position(&self, plugin_id: u32) -> Option<usize> {
         self.pane_manifest
             .panes
@@ -404,6 +471,9 @@ impl App {
     }
 
     fn refresh_current_view(&mut self) -> bool {
+        if !self.owns_status() {
+            return false;
+        }
         let Some(tab) = self.tabs.iter().find(|tab| tab.active) else {
             return false;
         };
@@ -575,6 +645,14 @@ impl App {
     }
 
     fn update_pane_manifest(&mut self, pane_manifest: PaneManifest) -> bool {
+        if self.plugin_url.is_none() {
+            self.plugin_url = pane_manifest
+                .panes
+                .values()
+                .flatten()
+                .find(|pane| pane.is_plugin && Some(pane.id) == self.plugin_id)
+                .and_then(|pane| pane.plugin_url.clone());
+        }
         let live_pane_ids = pane_manifest
             .panes
             .values()
@@ -582,43 +660,403 @@ impl App {
             .filter(|pane| !pane.is_plugin && !pane.exited)
             .map(|pane| pane.id)
             .collect::<BTreeSet<_>>();
-        let mut should_render = self.reconcile_live_panes(&live_pane_ids);
-        should_render |= self.discover_codex_panes(&pane_manifest);
+        let mut should_render = false;
+        if self.owns_status() {
+            should_render |= self.reconcile_live_panes(&live_pane_ids);
+            should_render |= self.discover_codex_panes(&pane_manifest);
+        }
         self.pane_manifest = pane_manifest;
+        if self.status_source.is_some() {
+            for report in std::mem::take(&mut self.pending_reports) {
+                self.receive_report(report);
+            }
+        }
         should_render |= self.refresh_current_view();
         if let Some(pending) = self.pending_floating_pane_suppression {
             self.pending_floating_pane_suppression = None;
             let panes = self.floating_pane_states(pending.tab_position, pending.tab_id);
             self.suppress_floating_panes(panes);
         }
-        if should_render {
-            self.save_agents();
+        if self.owns_status() {
+            self.publish_agents();
         }
         should_render
     }
 
+    fn update_session(&mut self, session: SessionInfo) {
+        if session.plugins.is_empty() {
+            return;
+        }
+        let Some(id) = self.plugin_id else {
+            return;
+        };
+        if let Some(plugin) = session.plugins.get(&id) {
+            self.plugin_url = Some(plugin.location.clone());
+        }
+        let Some(url) = self.plugin_url.as_ref() else {
+            return;
+        };
+        let peers = session
+            .plugins
+            .iter()
+            .filter(|(_, plugin)| &plugin.location == url)
+            .collect::<Vec<_>>();
+        let source = monitor_source(&session.plugins, url);
+        let previous_source = self.status_source;
+        self.status_source = source;
+        if source.is_some() {
+            self.monitor_start_pending = false;
+        }
+        if self.owns_status() {
+            self.status_observers = peers.iter().map(|(id, _)| **id).collect();
+            self.publish_agents();
+        } else if source.is_none()
+            && !self.monitor_start_pending
+            && peers.first().is_some_and(|(peer, _)| **peer == id)
+        {
+            self.monitor_start_pending = true;
+            #[cfg(target_family = "wasm")]
+            load_new_plugin(
+                "zellij:OWN_URL",
+                BTreeMap::from([("role".into(), "monitor".into())]),
+                true,
+                false,
+            );
+        } else if source != previous_source {
+            self.request_agent_sync(false);
+        }
+        if self.status_source.is_some() {
+            for report in std::mem::take(&mut self.pending_reports) {
+                self.receive_report(report);
+            }
+        }
+    }
+
     fn refresh_agents(&mut self) {
-        match get_session_list() {
-            Ok(snapshot) => {
-                if let Some(session) = snapshot
-                    .live_sessions
-                    .into_iter()
-                    .find(|session| session.is_current_session)
-                {
-                    self.tabs = session.tabs;
-                    self.update_pane_manifest(session.panes);
-                    self.error = None;
-                    self.save_agents();
+        if self.owns_status() {
+            self.error = None;
+            self.update_pane_manifest(self.pane_manifest.clone());
+        } else {
+            self.request_agent_sync(true);
+        }
+    }
+
+    fn owns_status(&self) -> bool {
+        self.plugin_id.is_none() || (self.is_monitor && self.status_source == self.plugin_id)
+    }
+
+    fn request_agent_sync(&self, _refresh: bool) {
+        #[cfg(target_family = "wasm")]
+        if let Some(source) = self.status_source {
+            let mut message =
+                MessageToPlugin::new(SYNC_AGENTS_PIPE_NAME).with_destination_plugin_id(source);
+            if _refresh {
+                message.message_args.insert("refresh".into(), "true".into());
+            }
+            pipe_message_to_plugin(message);
+        }
+    }
+
+    fn receive_report(&mut self, message: PipeMessage) -> bool {
+        if !self.owns_status() {
+            if !message.is_private {
+                return false;
+            }
+            if let Some(source) = self.status_source {
+                let mut forwarded =
+                    MessageToPlugin::new(PIPE_NAME).with_destination_plugin_id(source);
+                if let PipeSource::Cli(pipe_id) = &message.source {
+                    forwarded
+                        .message_args
+                        .insert("origin_pipe_id".into(), pipe_id.clone());
                 } else {
-                    self.error =
-                        Some("could not find the current Zellij session; press r to retry".into());
+                    forwarded.message_args = message.args;
+                }
+                forwarded.message_payload = message.payload;
+                pipe_message_to_plugin(forwarded);
+            } else {
+                self.pending_reports.push(message);
+            }
+            return false;
+        }
+        let Some(payload) = message.payload else {
+            return false;
+        };
+        let origin = match message.source {
+            PipeSource::Cli(pipe_id) => Some(pipe_id),
+            _ => message.args.get("origin_pipe_id").cloned(),
+        };
+        if let Some(origin) = origin {
+            let key = (origin, payload.clone());
+            if self.seen_reports.contains(&key) {
+                return false;
+            }
+            self.seen_reports.push_back(key);
+            if self.seen_reports.len() > 64 {
+                self.seen_reports.pop_front();
+            }
+        }
+        match serde_json::from_str(&payload) {
+            Ok(agent) => {
+                self.apply_report(agent);
+                self.refresh_current_view();
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("invalid status report: {error}")),
+        }
+        self.publish_agents();
+        true
+    }
+
+    fn accept_snapshot(&mut self, source: u32, snapshot: AgentSnapshot) -> bool {
+        if self.owns_status() || self.status_source != Some(source) {
+            return false;
+        }
+        let changed = self.agents != snapshot.agents || self.error != snapshot.error;
+        self.agents = snapshot.agents;
+        self.error = snapshot.error;
+        changed
+    }
+
+    fn publish_agents(&mut self) {
+        if !self.owns_status() {
+            return;
+        }
+        let snapshot = AgentSnapshot {
+            agents: self.agents.clone(),
+            error: self.error.clone(),
+        };
+        let changed = self.last_published.as_ref() != Some(&snapshot);
+        let peers: BTreeSet<u32> = self
+            .pane_manifest
+            .panes
+            .values()
+            .flatten()
+            .filter(|pane| pane.is_plugin && !pane.exited && pane.plugin_url == self.plugin_url)
+            .map(|pane| pane.id)
+            .chain(self.status_observers.iter().copied())
+            .filter(|id| Some(*id) != self.plugin_id)
+            .collect();
+        let recipients = if changed {
+            peers.clone()
+        } else {
+            peers.difference(&self.published_peers).copied().collect()
+        };
+        if changed {
+            self.schedule_checkpoint();
+        }
+        self.last_published = Some(snapshot.clone());
+        self.published_peers = peers;
+        if recipients.is_empty() {
+            return;
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let ids = get_plugin_ids();
+            let snapshot = serde_json::to_string(&snapshot).unwrap();
+            for id in &recipients {
+                pipe_message_to_plugin(
+                    MessageToPlugin::new(AGENT_SNAPSHOT_PIPE_NAME)
+                        .with_destination_plugin_id(*id)
+                        .with_payload(snapshot.clone())
+                        .with_args(BTreeMap::from([(
+                            "target_client_id".to_string(),
+                            ids.client_id.to_string(),
+                        )])),
+                );
+            }
+        }
+        let _ = recipients;
+    }
+
+    fn handle_event(&mut self, event: Event) -> bool {
+        match event {
+            Event::Timer(_) => {
+                if self.bootstrap_pending {
+                    self.bootstrap_pending = false;
+                    if self.status_source.is_none() || self.plugin_url.is_none() {
+                        if let Ok(snapshot) = get_session_list() {
+                            if let Some(session) = snapshot
+                                .live_sessions
+                                .into_iter()
+                                .find(|s| s.is_current_session)
+                            {
+                                self.update_session(session);
+                            }
+                        }
+                    }
+                    if self.status_source.is_none() || self.plugin_url.is_none() {
+                        self.bootstrap_pending = true;
+                        set_timeout(1.0);
+                    }
+                }
+                if self.checkpoint_pending {
+                    self.checkpoint_pending = false;
+                    self.save_agents();
+                    return false;
+                }
+                false
+            }
+            Event::Key(key) if key.bare_key == BareKey::Esc && key.key_modifiers.is_empty() => {
+                self.hide_dashboard();
+                false
+            }
+            Event::Key(key)
+                if key.bare_key == BareKey::Char('r') && key.key_modifiers.is_empty() =>
+            {
+                self.refresh_agents();
+                true
+            }
+            Event::PaneRenderReport(panes) => {
+                if !self.owns_status() {
+                    return false;
+                }
+                let mut changed = false;
+                for (pane_id, contents) in panes {
+                    if let PaneId::Terminal(pane_id) = pane_id {
+                        changed |= self.observe_pane_contents(pane_id, &contents.viewport);
+                    }
+                }
+                changed |= self.refresh_current_view();
+                if changed {
+                    self.publish_agents();
+                }
+                changed
+            }
+            Event::PaneUpdate(pane_manifest) => self.update_pane_manifest(pane_manifest),
+            Event::TabUpdate(tabs) => {
+                let tabs_changed = self.tabs != tabs;
+                self.tabs = tabs;
+                let status_changed = self.refresh_current_view();
+                if status_changed {
+                    self.publish_agents();
+                }
+                tabs_changed | status_changed
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_message(&mut self, message: PipeMessage) -> bool {
+        #[cfg(target_family = "wasm")]
+        if let PipeSource::Cli(pipe_id) = &message.source {
+            unblock_cli_pipe_input(pipe_id);
+        }
+        #[cfg(target_family = "wasm")]
+        if message.name == "stop_dashboard" {
+            if let Ok(snapshot) = get_session_list() {
+                if let Some(session) = snapshot.live_sessions.iter().find(|s| s.is_current_session)
+                {
+                    let own_id = get_plugin_ids().plugin_id;
+                    if let Some(own_plugin) = session.plugins.get(&own_id) {
+                        for (id, plugin) in &session.plugins {
+                            if plugin.location == own_plugin.location && *id != own_id {
+                                close_plugin_pane(*id);
+                            }
+                        }
+                    }
+                    // Background plugins have no pane for the CLI close-pane
+                    // action to find; the plugin API also unloads those instances.
+                    close_plugin_pane(own_id);
                 }
             }
-            Err(error) => {
-                self.error = Some(format!(
-                    "could not refresh agents: {error}; press r to retry"
-                ));
+            return false;
+        }
+        #[cfg(target_family = "wasm")]
+        if message.name == "list_agents" {
+            if let PipeSource::Cli(pipe_id) = &message.source {
+                if message.args.contains_key("include_metadata") {
+                    cli_pipe_output(
+                        pipe_id,
+                        &format!(
+                            "{}\n",
+                            serde_json::json!({
+                                "plugin_id": self.plugin_id,
+                                "client_id": get_plugin_ids().client_id,
+                                "status_source": self.status_source,
+                                "is_monitor": self.is_monitor,
+                                "error": self.error,
+                                "agents": self.agents,
+                            })
+                        ),
+                    );
+                    return false;
+                }
+                if let Ok(payload) = serde_json::to_string(&self.agents) {
+                    cli_pipe_output(pipe_id, &format!("{payload}\n"));
+                }
             }
+            return false;
+        }
+        if message.name == AGENT_SNAPSHOT_PIPE_NAME {
+            if message.args.get("target_client_id") != Some(&get_plugin_ids().client_id.to_string())
+            {
+                return false;
+            }
+            if let (PipeSource::Plugin(source), Some(payload)) = (&message.source, &message.payload)
+            {
+                if let Ok(snapshot) = serde_json::from_str(payload) {
+                    return self.accept_snapshot(*source, snapshot);
+                }
+            }
+            return false;
+        }
+        if message.name == SYNC_AGENTS_PIPE_NAME {
+            if self.owns_status() {
+                if let PipeSource::Plugin(source) = message.source {
+                    self.status_observers.insert(source);
+                    self.published_peers.remove(&source);
+                }
+                if message.args.contains_key("refresh") {
+                    self.refresh_agents();
+                } else {
+                    self.publish_agents();
+                }
+                return true;
+            }
+            return false;
+        }
+        if message.name == SHOW_DASHBOARD_PIPE_NAME {
+            if matches!(message.source, PipeSource::Plugin(_)) {
+                if message.args.get("target_client_id")
+                    != Some(&get_plugin_ids().client_id.to_string())
+                {
+                    return false;
+                }
+            }
+            if self.is_monitor {
+                return false;
+            }
+            if let Some(source) = message
+                .args
+                .get("status_source")
+                .and_then(|id| id.parse().ok())
+            {
+                self.status_source = Some(source);
+                if let Some(payload) = message.payload.as_ref() {
+                    if let Ok(snapshot) = serde_json::from_str(payload) {
+                        self.accept_snapshot(source, snapshot);
+                    }
+                }
+            }
+            self.show_dashboard();
+            if message.payload.is_some() {
+                self.request_agent_sync(false);
+            }
+            return true;
+        }
+        if message.name != PIPE_NAME {
+            return false;
+        }
+
+        self.receive_report(message)
+    }
+
+    fn schedule_checkpoint(&mut self) {
+        if !self.checkpoint_pending {
+            self.checkpoint_pending = true;
+            #[cfg(target_family = "wasm")]
+            set_timeout(0.5);
         }
     }
 
@@ -648,17 +1086,28 @@ impl App {
 
 impl ZellijPlugin for App {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.plugin_id = Some(get_plugin_ids().plugin_id);
+        self.is_monitor = configuration
+            .get("role")
+            .is_some_and(|role| role == "monitor");
+        self.dashboard_visible = !self.is_monitor;
+        if self.is_monitor {
+            self.status_source = self.plugin_id;
+        }
         self.dashboard_tab_id = configuration
             .get("dashboard_tab_id")
             .and_then(|value| value.parse().ok());
+        self.dashboard_named = self.dashboard_tab_id.is_some();
         #[cfg(target_family = "wasm")]
-        match std::fs::read(report_cache_path()) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(agents) => self.agents = agents,
-                Err(error) => eprintln!("could not decode cached agent reports: {error}"),
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!("could not read cached agent reports: {error}"),
+        if self.is_monitor {
+            match std::fs::read(report_cache_path()) {
+                Ok(bytes) => match serde_json::from_slice(&bytes) {
+                    Ok(agents) => self.agents = agents,
+                    Err(error) => eprintln!("could not decode cached agent reports: {error}"),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => eprintln!("could not read cached agent reports: {error}"),
+            }
         }
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -667,113 +1116,26 @@ impl ZellijPlugin for App {
             PermissionType::ReadPaneContents,
             PermissionType::MessageAndLaunchOtherPlugins,
         ]);
-        subscribe(&[
+        let mut events = vec![
             EventType::Key,
             EventType::PaneUpdate,
             EventType::TabUpdate,
-            EventType::PaneRenderReport,
             EventType::Timer,
-        ]);
-        if self.dashboard_tab_id.is_none() {
-            set_timeout(0.1);
+        ];
+        if self.is_monitor {
+            events.push(EventType::PaneRenderReport);
         }
+        subscribe(&events);
+        self.bootstrap_pending = true;
+        set_timeout(0.1);
     }
 
     fn update(&mut self, event: Event) -> bool {
-        match event {
-            Event::Timer(_) => {
-                if let Ok(snapshot) = get_session_list() {
-                    if let Some(session) = snapshot
-                        .live_sessions
-                        .into_iter()
-                        .find(|session| session.is_current_session)
-                    {
-                        let tabs_changed = self.tabs != session.tabs;
-                        self.tabs = session.tabs;
-                        return self.update_pane_manifest(session.panes) | tabs_changed;
-                    }
-                }
-                false
-            }
-            Event::Key(key) if key.bare_key == BareKey::Esc && key.key_modifiers.is_empty() => {
-                self.hide_dashboard();
-                false
-            }
-            Event::Key(key)
-                if key.bare_key == BareKey::Char('r') && key.key_modifiers.is_empty() =>
-            {
-                self.refresh_agents();
-                true
-            }
-            Event::PaneRenderReport(panes) => {
-                let mut changed = false;
-                for (pane_id, contents) in panes {
-                    if let PaneId::Terminal(pane_id) = pane_id {
-                        changed |= self.observe_pane_contents(pane_id, &contents.viewport);
-                    }
-                }
-                changed | self.refresh_current_view()
-            }
-            Event::PaneUpdate(pane_manifest) => self.update_pane_manifest(pane_manifest),
-            Event::TabUpdate(tabs) => {
-                self.tabs = tabs;
-                self.refresh_current_view();
-                true
-            }
-            _ => false,
-        }
+        self.handle_event(event) && self.dashboard_visible
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
-        #[cfg(target_family = "wasm")]
-        if let PipeSource::Cli(pipe_id) = &message.source {
-            unblock_cli_pipe_input(pipe_id);
-        }
-        #[cfg(target_family = "wasm")]
-        if message.name == "list_agents" {
-            if let PipeSource::Cli(pipe_id) = &message.source {
-                self.refresh_current_view();
-                if let Ok(payload) = serde_json::to_string(&self.agents) {
-                    cli_pipe_output(pipe_id, &format!("{payload}\n"));
-                }
-            }
-            return true;
-        }
-        if message.name == SHOW_DASHBOARD_PIPE_NAME {
-            if matches!(message.source, PipeSource::Plugin(_)) {
-                if message.args.get("target_client_id")
-                    != Some(&get_plugin_ids().client_id.to_string())
-                {
-                    return false;
-                }
-                if let Some(payload) = &message.payload {
-                    if let Ok(agents) = serde_json::from_str(payload) {
-                        self.agents = agents;
-                    }
-                }
-            }
-            self.show_dashboard();
-            return true;
-        }
-        if message.name != PIPE_NAME {
-            return false;
-        }
-
-        let Some(payload) = message.payload else {
-            return false;
-        };
-
-        match serde_json::from_str(&payload) {
-            Ok(agent) => {
-                let agent: AgentReport = agent;
-                self.apply_report(agent);
-                self.refresh_current_view();
-                self.error = None;
-                self.save_agents();
-            }
-            Err(error) => self.error = Some(format!("invalid status report: {error}")),
-        }
-        true
+        self.handle_message(message) && self.dashboard_visible
     }
 
     fn render(&mut self, _rows: usize, _cols: usize) {
@@ -814,6 +1176,19 @@ impl ZellijPlugin for App {
         println!();
         println!("r: refresh agents · Esc: hide dashboard");
     }
+}
+
+fn monitor_source(plugins: &BTreeMap<u32, PluginInfo>, url: &str) -> Option<u32> {
+    plugins
+        .iter()
+        .find(|(_, plugin)| {
+            plugin.location == url
+                && plugin
+                    .configuration
+                    .get("role")
+                    .is_some_and(|role| role == "monitor")
+        })
+        .map(|(id, _)| *id)
 }
 
 fn codex_activity(viewport: &[String]) -> Option<bool> {
@@ -912,6 +1287,130 @@ mod tests {
     }
 
     #[test]
+    fn dashboards_share_status_without_reinterpreting_the_current_tab() {
+        let mut owner = App {
+            plugin_id: Some(4),
+            status_source: Some(4),
+            is_monitor: true,
+            ..Default::default()
+        };
+        let mut dashboard = App {
+            plugin_id: Some(7),
+            status_source: Some(4),
+            ..Default::default()
+        };
+        for status in [Status::Running, Status::Done, Status::Idle] {
+            owner.apply_report(AgentReport {
+                id: "agent".into(),
+                agent: "codex".into(),
+                status,
+                task: String::new(),
+                worktree: String::new(),
+                pane_id: Some(12),
+                tab_id: Some(2),
+                tab_position: Some(0),
+                remove: false,
+            });
+            let snapshot = AgentSnapshot {
+                agents: owner.agents.clone(),
+                error: None,
+            };
+            assert!(dashboard.accept_snapshot(4, snapshot.clone()));
+            assert!(!dashboard.accept_snapshot(
+                99,
+                AgentSnapshot {
+                    agents: BTreeMap::new(),
+                    error: None,
+                }
+            ));
+            dashboard.update(Event::TabUpdate(vec![TabInfo {
+                tab_id: 2,
+                position: 0,
+                active: true,
+                ..Default::default()
+            }]));
+            assert!(!dashboard.refresh_current_view());
+            dashboard.update(Event::PaneRenderReport(std::collections::HashMap::from([
+                (
+                    PaneId::Terminal(12),
+                    PaneContents {
+                        viewport: vec!["• Working (esc to interrupt)".into()],
+                        ..Default::default()
+                    },
+                ),
+            ])));
+            assert_eq!(dashboard.agents, owner.agents);
+            assert!(!owner.accept_snapshot(7, snapshot));
+        }
+    }
+
+    #[test]
+    fn relayed_duplicates_do_not_restore_an_older_status() {
+        let mut app = App {
+            plugin_id: Some(4),
+            ..Default::default()
+        };
+        let running = PipeMessage::new(
+            PipeSource::Cli("first-report".into()),
+            PIPE_NAME,
+            &Some(r#"{"id":"agent","agent":"codex","status":"running"}"#.into()),
+            &None,
+            true,
+        );
+        assert!(!app.receive_report(running.clone()));
+        app.is_monitor = true;
+        app.update_session(SessionInfo {
+            plugins: BTreeMap::from([(
+                4,
+                PluginInfo {
+                    location: "file:codex.wasm".into(),
+                    configuration: BTreeMap::from([("role".into(), "monitor".into())]),
+                },
+            )]),
+            ..Default::default()
+        });
+        assert_eq!(app.agents["agent"].status, Status::Running);
+        assert!(app.receive_report(PipeMessage::new(
+            PipeSource::Cli("second-report".into()),
+            PIPE_NAME,
+            &Some(r#"{"id":"agent","agent":"codex","status":"done"}"#.into()),
+            &None,
+            true,
+        )));
+        let mut forwarded = running;
+        forwarded.source = PipeSource::Plugin(7);
+        forwarded
+            .args
+            .insert("origin_pipe_id".into(), "first-report".into());
+        assert!(!app.receive_report(forwarded));
+        assert_eq!(app.agents["agent"].status, Status::Done);
+    }
+
+    #[test]
+    fn status_owner_is_the_background_monitor() {
+        let url = "file:codex.wasm";
+        let mut plugins = BTreeMap::from([
+            (
+                4,
+                PluginInfo {
+                    location: url.into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                7,
+                PluginInfo {
+                    location: url.into(),
+                    configuration: BTreeMap::from([("role".into(), "monitor".into())]),
+                },
+            ),
+        ]);
+        assert_eq!(monitor_source(&plugins, url), Some(7));
+        plugins.remove(&7);
+        assert_eq!(monitor_source(&plugins, url), None);
+    }
+
+    #[test]
     fn tab_names_follow_stable_ids_and_live_renames() {
         let mut app = App::default();
         app.tabs = vec![
@@ -936,7 +1435,7 @@ mod tests {
 
         let mut tabs = app.tabs.clone();
         tabs[0].name = "renamed".into();
-        assert!(app.update(Event::TabUpdate(tabs)));
+        assert!(app.handle_event(Event::TabUpdate(tabs)));
         assert_eq!(app.agent_tab_name(&report), "renamed");
 
         app.tabs.remove(0);

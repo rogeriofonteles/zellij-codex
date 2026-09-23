@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Apply one lifecycle report to native Zellij titles; no resident monitor."""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+BADGES = {
+    "running": "[🟠 ↻] ",
+    "input": "[🔴 !] ",
+    "done": "[🔵 ✓] ",
+    "stuck": "[🟡 !] ",
+    "error": "[🔴 ✕] ",
+    "paused": "[🟡 Ⅱ] ",
+    "idle": "",
+}
+PRIORITY = {
+    "idle": 0,
+    "paused": 2,
+    "running": 3,
+    "done": 4,
+    "stuck": 5,
+    "error": 6,
+    "input": 7,
+}
+
+
+def badge_title(title: str, status: str) -> str:
+    for badge in (*BADGES.values(), "[🔴 ↻] ", "[🟡 !] "):
+        if badge and title.startswith(badge):
+            title = title[len(badge) :]
+            break
+    return BADGES[status] + title
+
+
+def reconcile(
+    state: dict[str, Any], panes: list[dict[str, Any]], report: dict[str, Any]
+) -> tuple[dict[str, Any], list[list[str]]]:
+    """Plan only changed titles, resolving pane locations from the live manifest."""
+    live = {str(p["id"]): p for p in panes if not p["is_plugin"] and not p["exited"]}
+    statuses = {
+        key: value for key, value in state.get("statuses", {}).items() if key in live
+    }
+    waiting = {
+        key: value for key, value in state.get("waiting", {}).items() if key in live
+    }
+    clear_pane = str(report.get("clear_done_pane_id", ""))
+    if clear_pane in live and statuses.get(clear_pane) == "done":
+        statuses[clear_pane] = "idle"
+        waiting.pop(clear_pane, None)
+    pane_id = str(report.get("pane_id", ""))
+    if pane_id in live:
+        if report.get("remove"):
+            statuses.pop(pane_id, None)
+            waiting.pop(pane_id, None)
+        elif report.get("status") in BADGES:
+            status = report["status"]
+            event = report.get("event")
+            tool = report.get("tool_name", "")
+            pending = waiting.get(pane_id)
+            if event == "PermissionRequest" or (
+                event == "PreToolUse" and status == "input"
+            ):
+                waiting[pane_id] = tool
+            elif event == "PostToolUse" and pending is not None:
+                # Other tools can complete while a question is still open.
+                # An asynchronous question stays open until the next user prompt.
+                if pending != tool or pending.endswith("request_user_input_async"):
+                    status = "input"
+                else:
+                    waiting.pop(pane_id, None)
+            elif (
+                event == "Stop"
+                and pending is not None
+                and pending.endswith("request_user_input_async")
+            ):
+                status = "input"
+            else:
+                waiting.pop(pane_id, None)
+            statuses[pane_id] = status
+
+    actions: list[list[str]] = []
+    for key, pane in live.items():
+        # Recognizing our own prefix also recovers interrupted writes without
+        # accumulating badges or taking ownership of unrelated pane titles.
+        title = pane["title"]
+        desired = badge_title(title, statuses.get(key, "idle"))
+        if desired != title:
+            actions.append(
+                ["rename-pane", "--pane-id", f"terminal_{key}", "--", desired]
+            )
+
+    tabs = {str(p["tab_id"]): p["tab_name"] for p in panes}
+    tab_statuses = dict.fromkeys(tabs, "idle")
+    for key, status in statuses.items():
+        tab_id = str(live[key]["tab_id"])
+        if PRIORITY[status] > PRIORITY[tab_statuses[tab_id]]:
+            tab_statuses[tab_id] = status
+    for tab_id, title in tabs.items():
+        desired = badge_title(title, tab_statuses[tab_id])
+        if desired != title:
+            actions.append(["rename-tab-by-id", tab_id, "--", desired])
+    return {"statuses": statuses, "waiting": waiting}, actions
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--session", default=os.environ.get("ZELLIJ_SESSION_NAME"))
+    parser.add_argument(
+        "--pane-id",
+        type=int,
+        default=os.environ.get("ZELLIJ_PANE_ID"),
+        help="Terminal pane ID for --clear-done (defaults to this pane).",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Clear closed panes and recompute badges.",
+    )
+    mode.add_argument(
+        "--clear-done",
+        action="store_true",
+        help="Clear this pane's completed badge, preserving running and input states.",
+    )
+    args = parser.parse_args()
+    if args.clear_done and args.pane_id is None:
+        parser.error("--clear-done requires --pane-id or ZELLIJ_PANE_ID")
+    if not args.session:
+        raise SystemExit(
+            "A Zellij session is required (--session or ZELLIJ_SESSION_NAME)."
+        )
+    report = {} if args.refresh or args.clear_done else json.load(sys.stdin)
+    command = ["zellij", "--session", args.session, "action"]
+    cache = (
+        Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        / "zellij-codex/badges"
+    )
+    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+    identity = _session_identity(args.session)
+    path = cache / f"{identity}.json"
+    with (cache / f"{identity}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = json.loads(path.read_text()) if path.exists() else {}
+        panes = json.loads(
+            subprocess.check_output(
+                [*command, "list-panes", "--all", "--json"],
+                text=True,
+                timeout=2,
+            )
+        )
+        if args.clear_done:
+            report["clear_done_pane_id"] = args.pane_id
+        state, actions = reconcile(state, panes, report)
+        for action in actions:
+            subprocess.run(
+                [*command, *action], check=True, capture_output=True, timeout=2
+            )
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state) + "\n")
+        temporary.replace(path)
+
+
+def _session_identity(session: str) -> str:
+    candidates = [
+        Path(os.environ.get("ZELLIJ_SOCKET_DIR", f"/tmp/zellij-{os.getuid()}"))
+    ]
+    if runtime := os.environ.get("XDG_RUNTIME_DIR"):
+        candidates.append(Path(runtime) / "zellij")
+    for directory in candidates:
+        for contract in directory.glob("contract_version_*"):
+            socket = contract / session
+            if not socket.is_socket():
+                continue
+            stat = socket.stat()
+            identity = f"{socket}:{stat.st_ino}:{stat.st_mtime_ns}"
+            return hashlib.sha256(identity.encode()).hexdigest()
+    raise SystemExit(f"Could not find the socket for Zellij session {session!r}.")
+
+
+if __name__ == "__main__":
+    main()

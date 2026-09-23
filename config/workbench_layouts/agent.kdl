@@ -1,0 +1,16 @@
+layout {
+    tab name="agent" focus=true {
+        pane size=1 borderless=true {
+            plugin location=__TAB_BAR_PLUGIN__
+        }
+        pane split_direction="vertical" {
+            pane size="45%" focus=true name="Git / Shell"
+            pane size="55%" command="bash" {
+                args "-lc" "unset NO_COLOR; if [[ ${TERM:-} == screen ]] && infocmp screen-256color >/dev/null 2>&1; then export TERM=screen-256color; fi; export COLORTERM=${COLORTERM:-truecolor}; if command -v zellij-codex-launch >/dev/null 2>&1; then exec zellij-codex-launch --yolo; else exec codex --yolo; fi"
+            }
+        }
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+}
