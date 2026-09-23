@@ -80,6 +80,24 @@ an existing session without restarting terminals, run
 `./scripts/install-tab-bar --session SESSION`. The Ctrl+T, N binding reloads with
 the config; the session's other default-layout settings take effect after restart.
 
+### Existing Codex sessions after a hook upgrade
+
+An already-running Codex process can keep its previous hook configuration even
+when `hooks.json` and the trusted hook settings on disk are up to date. Its pane
+can keep showing idle or done while Codex is working. Refresh each affected
+Codex process; refreshing Zellij or reinstalling the reporter alone is insufficient.
+
+Without interrupting the current task, open `/hooks`, select `PostToolUse`, and
+open the handler whose command ends in `zellij-codex-hook`. If it is already
+trusted and enabled, press Space to disable it, then Space again to enable it.
+Confirm it is checked, then press Esc twice to return to the conversation. The
+toggle reloads that process's hook configuration, and its next lifecycle event
+updates the badges. Review new or modified hooks before enabling them. Another
+option is to exit and resume Codex after its current task finishes.
+
+The badge reporter does not infer status from screen text: if no lifecycle event
+arrives, `--refresh` only recomputes existing statuses and cannot detect running work.
+
 ## Status badges (default)
 
 Run `./scripts/install`, then start a new Codex conversation and review its
