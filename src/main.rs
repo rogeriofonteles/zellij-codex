@@ -8,7 +8,6 @@ use zellij_tile::prelude::*;
 const PIPE_NAME: &str = "codex_status";
 const SHOW_DASHBOARD_PIPE_NAME: &str = "show_dashboard";
 const DASHBOARD_PANE_TITLE: &str = "Codex Dashboard";
-const NEOVIM_PANE_TITLE: &str = "Neovim";
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -87,13 +86,13 @@ struct App {
     error: Option<String>,
     pane_manifest: PaneManifest,
     tabs: Vec<TabInfo>,
-    visible_neovim: Option<SuppressedNeovim>,
-    suppressed_neovim: Option<SuppressedNeovim>,
-    pending_neovim_suppression: Option<PendingNeovimSuppression>,
+    visible_floating_pane: Option<FloatingPaneState>,
+    suppressed_floating_panes: Vec<FloatingPaneState>,
+    pending_floating_pane_suppression: Option<PendingFloatingPaneSuppression>,
 }
 
 #[derive(Clone, Copy)]
-struct SuppressedNeovim {
+struct FloatingPaneState {
     pane_id: PaneId,
     tab_id: Option<usize>,
     rectangle: PaneRectangle,
@@ -118,7 +117,7 @@ impl PaneRectangle {
 }
 
 #[derive(Clone, Copy)]
-struct PendingNeovimSuppression {
+struct PendingFloatingPaneSuppression {
     tab_position: usize,
     tab_id: Option<usize>,
 }
@@ -184,6 +183,7 @@ impl App {
             pipe_message_to_plugin(message);
             return;
         }
+        self.refresh_agents();
         if focused_pane_id == PaneId::Plugin(get_plugin_ids().plugin_id) {
             self.center_dashboard();
             return;
@@ -194,55 +194,49 @@ impl App {
             .as_ref()
             .is_some_and(|pane| !pane.is_floating && !pane.is_suppressed);
         self.observe_current_view(tab_position, focused_pane_id, codex_surface_is_visible);
-        self.error = None;
-        self.visible_neovim = focused_pane_info
-            .filter(|pane| {
-                pane.is_floating && !pane.is_suppressed && pane.title == NEOVIM_PANE_TITLE
-            })
-            .map(|pane| SuppressedNeovim {
+        self.visible_floating_pane = focused_pane_info
+            .filter(|pane| pane.is_floating && !pane.is_suppressed)
+            .map(|pane| FloatingPaneState {
                 pane_id: focused_pane_id,
                 tab_id: self.tab_id_at_position(tab_position),
                 rectangle: pane_rectangle(&pane),
             });
-        self.suppressed_neovim = None;
-        self.pending_neovim_suppression = None;
+        self.suppressed_floating_panes.clear();
+        self.pending_floating_pane_suppression = None;
         let tab_id = self.tab_id_at_position(tab_position);
-        let should_suppress_neovim = codex_surface_is_visible;
-        let neovim_to_suppress = should_suppress_neovim
-            .then(|| self.neovim_pane_id(tab_position))
-            .flatten()
-            .and_then(|pane_id| self.neovim_state(pane_id, tab_id));
-        if should_suppress_neovim && neovim_to_suppress.is_none() {
-            self.pending_neovim_suppression = Some(PendingNeovimSuppression {
+        let panes_to_suppress = if codex_surface_is_visible {
+            self.floating_pane_states(tab_position, tab_id)
+        } else {
+            Vec::new()
+        };
+        if codex_surface_is_visible && panes_to_suppress.is_empty() {
+            self.pending_floating_pane_suppression = Some(PendingFloatingPaneSuppression {
                 tab_position,
                 tab_id,
             });
         }
 
         rename_plugin_pane(get_plugin_ids().plugin_id, DASHBOARD_PANE_TITLE);
-        if let Some(neovim) = neovim_to_suppress {
-            self.suppress_neovim(neovim);
-        }
+        self.suppress_floating_panes(panes_to_suppress);
         show_self(true);
         self.center_dashboard();
         focus_pane_with_id(PaneId::Plugin(get_plugin_ids().plugin_id), true, true);
     }
 
     fn hide_dashboard(&mut self) {
-        self.pending_neovim_suppression = None;
+        self.pending_floating_pane_suppression = None;
         hide_self();
-        if let Some(neovim) = self.visible_neovim.take() {
-            change_floating_panes_coordinates(vec![(
-                neovim.pane_id,
-                neovim.rectangle.coordinates(),
-            )]);
-        } else if let Some(neovim) = self.suppressed_neovim.take() {
-            show_pane_with_id(neovim.pane_id, true, false);
-            change_floating_panes_coordinates(vec![(
-                neovim.pane_id,
-                neovim.rectangle.coordinates(),
-            )]);
-            if let Err(error) = hide_floating_panes(neovim.tab_id) {
+        if let Some(pane) = self.visible_floating_pane.take() {
+            change_floating_panes_coordinates(vec![(pane.pane_id, pane.rectangle.coordinates())]);
+        }
+        let mut tabs_to_hide = BTreeSet::new();
+        for pane in self.suppressed_floating_panes.drain(..) {
+            show_pane_with_id(pane.pane_id, true, false);
+            change_floating_panes_coordinates(vec![(pane.pane_id, pane.rectangle.coordinates())]);
+            tabs_to_hide.insert(pane.tab_id);
+        }
+        for tab_id in tabs_to_hide {
+            if let Err(error) = hide_floating_panes(tab_id) {
                 self.error = Some(format!("could not restore the workbench view: {error}"));
             }
         }
@@ -263,6 +257,18 @@ impl App {
             .iter()
             .find(|tab| tab.position == tab_position)
             .map(|tab| tab.tab_id)
+    }
+
+    fn agent_tab_name(&self, agent: &AgentReport) -> &str {
+        self.tabs
+            .iter()
+            .find(|tab| match agent.tab_id {
+                Some(tab_id) => tab.tab_id == tab_id,
+                None => agent.tab_position == Some(tab.position),
+            })
+            .map(|tab| tab.name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("—")
     }
 
     fn known_tab_location(&self, pane_id: u32) -> (Option<usize>, Option<usize>) {
@@ -289,21 +295,29 @@ impl App {
             })
     }
 
-    fn neovim_pane_id(&self, tab_position: usize) -> Option<PaneId> {
-        // PaneUpdate can lag behind show_pane_with_id()/hide_pane_with_id(). Use
-        // the manifest only to locate Neovim's stable pane ID, then decide from
-        // the synchronous live pane state. Otherwise a manifest captured while
-        // Neovim was suppressed prevents the next dashboard opening from hiding
-        // it, and show_self() reveals both floating panes.
-        let pane_id = neovim_pane_candidate(self.pane_manifest.panes.get(&tab_position)?)?;
-        get_pane_info(pane_id)
-            .filter(|pane| {
-                !pane.is_plugin
-                    && pane.is_floating
-                    && !pane.is_suppressed
-                    && pane.title == NEOVIM_PANE_TITLE
+    fn floating_pane_states(
+        &self,
+        tab_position: usize,
+        tab_id: Option<usize>,
+    ) -> Vec<FloatingPaneState> {
+        let Some(panes) = self.pane_manifest.panes.get(&tab_position) else {
+            return Vec::new();
+        };
+        // PaneUpdate can lag behind restoration, so recheck candidates against
+        // live state before deciding which panes opening the dashboard would reveal.
+        floating_pane_candidates(panes)
+            .into_iter()
+            .filter(|pane_id| *pane_id != PaneId::Plugin(get_plugin_ids().plugin_id))
+            .filter_map(|pane_id| {
+                get_pane_info(pane_id)
+                    .filter(|pane| pane.is_floating && !pane.is_suppressed && !pane.exited)
+                    .map(|pane| FloatingPaneState {
+                        pane_id,
+                        tab_id,
+                        rectangle: pane_rectangle(&pane),
+                    })
             })
-            .map(|_| pane_id)
+            .collect()
     }
 
     fn plugin_tab_position(&self, plugin_id: u32) -> Option<usize> {
@@ -503,6 +517,8 @@ impl App {
 
     fn reconcile_live_panes(&mut self, live_pane_ids: &BTreeSet<u32>) -> bool {
         let agents_before = self.agents.clone();
+        self.recovered_running_panes
+            .retain(|pane_id| live_pane_ids.contains(pane_id));
         self.agents.retain(|_, agent| {
             agent
                 .pane_id
@@ -528,11 +544,13 @@ impl App {
         });
 
         for (pane_id, worktree, tab_id, tab_position) in discovered {
-            if self
+            if let Some(agent) = self
                 .agents
-                .values()
-                .any(|agent| agent.pane_id == Some(pane_id))
+                .values_mut()
+                .find(|agent| agent.pane_id == Some(pane_id))
             {
+                agent.tab_id = tab_id;
+                agent.tab_position = Some(tab_position);
                 continue;
             }
 
@@ -568,31 +586,63 @@ impl App {
         should_render |= self.discover_codex_panes(&pane_manifest);
         self.pane_manifest = pane_manifest;
         should_render |= self.refresh_current_view();
-        if let Some(pending) = self.pending_neovim_suppression {
-            if let Some(neovim_pane_id) = self.neovim_pane_id(pending.tab_position) {
-                self.pending_neovim_suppression = None;
-                if let Some(neovim) = self.neovim_state(neovim_pane_id, pending.tab_id) {
-                    self.suppress_neovim(neovim);
-                }
-            }
+        if let Some(pending) = self.pending_floating_pane_suppression {
+            self.pending_floating_pane_suppression = None;
+            let panes = self.floating_pane_states(pending.tab_position, pending.tab_id);
+            self.suppress_floating_panes(panes);
+        }
+        if should_render {
+            self.save_agents();
         }
         should_render
     }
 
-    fn neovim_state(&self, pane_id: PaneId, tab_id: Option<usize>) -> Option<SuppressedNeovim> {
-        let Some(pane_info) = get_pane_info(pane_id) else {
-            return None;
-        };
-        Some(SuppressedNeovim {
-            pane_id,
-            tab_id,
-            rectangle: pane_rectangle(&pane_info),
-        })
+    fn refresh_agents(&mut self) {
+        match get_session_list() {
+            Ok(snapshot) => {
+                if let Some(session) = snapshot
+                    .live_sessions
+                    .into_iter()
+                    .find(|session| session.is_current_session)
+                {
+                    self.tabs = session.tabs;
+                    self.update_pane_manifest(session.panes);
+                    self.error = None;
+                    self.save_agents();
+                } else {
+                    self.error =
+                        Some("could not find the current Zellij session; press r to retry".into());
+                }
+            }
+            Err(error) => {
+                self.error = Some(format!(
+                    "could not refresh agents: {error}; press r to retry"
+                ));
+            }
+        }
     }
 
-    fn suppress_neovim(&mut self, neovim: SuppressedNeovim) {
-        hide_pane_with_id(neovim.pane_id);
-        self.suppressed_neovim = Some(neovim);
+    fn save_agents(&self) {
+        #[cfg(target_family = "wasm")]
+        if let Err(error) = serde_json::to_vec(&self.agents)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                let path = report_cache_path();
+                let ids = get_plugin_ids();
+                let temporary = format!("{path}.{}.{}", ids.plugin_id, ids.client_id);
+                std::fs::write(&temporary, bytes)?;
+                std::fs::rename(temporary, path)
+            })
+        {
+            eprintln!("could not cache agent reports: {error}");
+        }
+    }
+
+    fn suppress_floating_panes(&mut self, panes: Vec<FloatingPaneState>) {
+        for pane in panes {
+            hide_pane_with_id(pane.pane_id);
+            self.suppressed_floating_panes.push(pane);
+        }
     }
 }
 
@@ -638,8 +688,9 @@ impl ZellijPlugin for App {
                         .into_iter()
                         .find(|session| session.is_current_session)
                     {
+                        let tabs_changed = self.tabs != session.tabs;
                         self.tabs = session.tabs;
-                        return self.update_pane_manifest(session.panes);
+                        return self.update_pane_manifest(session.panes) | tabs_changed;
                     }
                 }
                 false
@@ -647,6 +698,12 @@ impl ZellijPlugin for App {
             Event::Key(key) if key.bare_key == BareKey::Esc && key.key_modifiers.is_empty() => {
                 self.hide_dashboard();
                 false
+            }
+            Event::Key(key)
+                if key.bare_key == BareKey::Char('r') && key.key_modifiers.is_empty() =>
+            {
+                self.refresh_agents();
+                true
             }
             Event::PaneRenderReport(panes) => {
                 let mut changed = false;
@@ -660,7 +717,8 @@ impl ZellijPlugin for App {
             Event::PaneUpdate(pane_manifest) => self.update_pane_manifest(pane_manifest),
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
-                self.refresh_current_view()
+                self.refresh_current_view();
+                true
             }
             _ => false,
         }
@@ -711,18 +769,7 @@ impl ZellijPlugin for App {
                 self.apply_report(agent);
                 self.refresh_current_view();
                 self.error = None;
-                #[cfg(target_family = "wasm")]
-                if let Err(error) = serde_json::to_vec(&self.agents)
-                    .map_err(std::io::Error::other)
-                    .and_then(|bytes| {
-                        let path = report_cache_path();
-                        let temporary = format!("{path}.{}", get_plugin_ids().client_id);
-                        std::fs::write(&temporary, bytes)?;
-                        std::fs::rename(temporary, path)
-                    })
-                {
-                    eprintln!("could not cache agent reports: {error}");
-                }
+                self.save_agents();
             }
             Err(error) => self.error = Some(format!("invalid status report: {error}")),
         }
@@ -732,17 +779,19 @@ impl ZellijPlugin for App {
     fn render(&mut self, _rows: usize, _cols: usize) {
         if let Some(error) = &self.error {
             println!("\u{1b}[91m✕ {error}\u{1b}[0m");
+            println!("r: refresh agents · Esc: hide dashboard");
             return;
         }
 
         if self.agents.is_empty() {
             println!("Waiting for a Codex status report…");
+            println!("r: refresh agents · Esc: hide dashboard");
             return;
         }
 
         println!(
-            "{:<20}  {:<18}  {:<12}  TASK",
-            "WORKTREE", "AGENT", "STATUS"
+            "{:<20}  {:<20}  {:<18}  {:<12}  TASK",
+            "TAB", "WORKTREE", "AGENT", "STATUS"
         );
         for agent in self.agents.values() {
             let pane = agent.pane_id.map(|id| format!("p{id}")).unwrap_or_default();
@@ -752,7 +801,8 @@ impl ZellijPlugin for App {
                 format!("{} ({pane})", agent.agent)
             };
             println!(
-                "{:<20}  {:<18}  \u{1b}[{}m{} {:<9}\u{1b}[0m  {}",
+                "{:<20}  {:<20}  {:<18}  \u{1b}[{}m{} {:<9}\u{1b}[0m  {}",
+                truncate(self.agent_tab_name(agent), 20),
                 truncate(&agent.worktree, 20),
                 truncate(&agent_label, 18),
                 agent.status.ansi_color(),
@@ -762,7 +812,7 @@ impl ZellijPlugin for App {
             );
         }
         println!();
-        println!("Esc: hide dashboard");
+        println!("r: refresh agents · Esc: hide dashboard");
     }
 }
 
@@ -828,11 +878,18 @@ fn is_codex_command(command: &[String]) -> bool {
     })
 }
 
-fn neovim_pane_candidate(panes: &[PaneInfo]) -> Option<PaneId> {
+fn floating_pane_candidates(panes: &[PaneInfo]) -> Vec<PaneId> {
     panes
         .iter()
-        .find(|pane| !pane.is_plugin && !pane.exited && pane.title == NEOVIM_PANE_TITLE)
-        .map(|pane| PaneId::Terminal(pane.id))
+        .filter(|pane| !pane.exited && (pane.is_floating || pane.is_suppressed))
+        .map(|pane| {
+            if pane.is_plugin {
+                PaneId::Plugin(pane.id)
+            } else {
+                PaneId::Terminal(pane.id)
+            }
+        })
+        .collect()
 }
 
 fn pane_rectangle(pane: &PaneInfo) -> PaneRectangle {
@@ -852,6 +909,58 @@ mod tests {
     #[no_mangle]
     extern "C" fn host_run_plugin_command() {
         panic!("unit tests must not call the Zellij host");
+    }
+
+    #[test]
+    fn tab_names_follow_stable_ids_and_live_renames() {
+        let mut app = App::default();
+        app.tabs = vec![
+            TabInfo {
+                tab_id: 7,
+                position: 0,
+                name: "source".into(),
+                ..Default::default()
+            },
+            TabInfo {
+                tab_id: 8,
+                position: 1,
+                name: "other".into(),
+                ..Default::default()
+            },
+        ];
+        let report: AgentReport = serde_json::from_str(
+            r#"{"id":"thread-1","agent":"codex","status":"idle","tab_id":7,"tab_position":1}"#,
+        )
+        .unwrap();
+        assert_eq!(app.agent_tab_name(&report), "source");
+
+        let mut tabs = app.tabs.clone();
+        tabs[0].name = "renamed".into();
+        assert!(app.update(Event::TabUpdate(tabs)));
+        assert_eq!(app.agent_tab_name(&report), "renamed");
+
+        app.tabs.remove(0);
+        assert_eq!(app.agent_tab_name(&report), "—");
+    }
+
+    #[test]
+    fn tab_names_support_legacy_positions_and_unknown_locations() {
+        let app = App {
+            tabs: vec![TabInfo {
+                tab_id: 7,
+                position: 2,
+                name: "legacy".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut report: AgentReport = serde_json::from_str(
+            r#"{"id":"thread-1","agent":"codex","status":"idle","tab_position":2}"#,
+        )
+        .unwrap();
+        assert_eq!(app.agent_tab_name(&report), "legacy");
+        report.tab_position = None;
+        assert_eq!(app.agent_tab_name(&report), "—");
     }
 
     #[test]
@@ -1011,16 +1120,46 @@ mod tests {
     }
 
     #[test]
-    fn stale_suppressed_neovim_is_still_a_live_lookup_candidate() {
-        let panes = vec![PaneInfo {
-            id: 17,
-            title: NEOVIM_PANE_TITLE.to_string(),
-            is_floating: false,
-            is_suppressed: true,
-            ..PaneInfo::default()
-        }];
+    fn floating_candidates_include_manual_panes_and_stale_suppressed_panes() {
+        let panes = vec![
+            PaneInfo {
+                id: 17,
+                title: "[host] project / editor".into(),
+                is_suppressed: true,
+                ..PaneInfo::default()
+            },
+            PaneInfo {
+                id: 18,
+                title: "manual editor".into(),
+                is_floating: true,
+                ..PaneInfo::default()
+            },
+            PaneInfo {
+                id: 19,
+                is_plugin: true,
+                is_floating: true,
+                ..PaneInfo::default()
+            },
+            PaneInfo {
+                id: 20,
+                ..PaneInfo::default()
+            },
+            PaneInfo {
+                id: 21,
+                is_floating: true,
+                exited: true,
+                ..PaneInfo::default()
+            },
+        ];
 
-        assert_eq!(neovim_pane_candidate(&panes), Some(PaneId::Terminal(17)));
+        assert_eq!(
+            floating_pane_candidates(&panes),
+            vec![
+                PaneId::Terminal(17),
+                PaneId::Terminal(18),
+                PaneId::Plugin(19)
+            ]
+        );
     }
 
     #[test]
@@ -1079,6 +1218,59 @@ mod tests {
         assert!(app.reconcile_live_panes(&BTreeSet::new()));
         assert_eq!(app.agents.len(), 1);
         assert!(app.agents.contains_key("remote-agent"));
+    }
+
+    #[test]
+    fn manifest_refresh_prunes_closed_agents_and_updates_surviving_locations() {
+        let mut app = App::default();
+        app.tabs = vec![TabInfo {
+            tab_id: 7,
+            position: 2,
+            name: "live".into(),
+            ..Default::default()
+        }];
+        for pane_id in [1, 2, 3] {
+            let report: AgentReport = serde_json::from_value(serde_json::json!({
+                "id": format!("agent-{pane_id}"),
+                "agent": "codex",
+                "status": "running",
+                "pane_id": pane_id,
+                "tab_id": 99,
+                "tab_position": 8,
+            }))
+            .unwrap();
+            app.apply_report(report);
+        }
+        app.recovered_running_panes = BTreeSet::from([1, 2, 3]);
+        let manifest = PaneManifest {
+            panes: std::collections::HashMap::from([(
+                2,
+                vec![
+                    PaneInfo {
+                        id: 1,
+                        ..Default::default()
+                    },
+                    PaneInfo {
+                        id: 2,
+                        exited: true,
+                        ..Default::default()
+                    },
+                    PaneInfo {
+                        id: 4,
+                        terminal_command: Some("codex".into()),
+                        ..Default::default()
+                    },
+                ],
+            )]),
+        };
+        assert!(app.update_pane_manifest(manifest.clone()));
+        assert_eq!(app.agents.len(), 2);
+        let survivor = &app.agents["agent-1"];
+        assert_eq!(survivor.status, Status::Running);
+        assert_eq!((survivor.tab_id, survivor.tab_position), (Some(7), Some(2)));
+        assert!(app.agents.contains_key("discovered:pane:4"));
+        assert_eq!(app.recovered_running_panes, BTreeSet::from([1]));
+        assert!(!app.update_pane_manifest(manifest));
     }
 
     #[test]

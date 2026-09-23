@@ -4,6 +4,7 @@
 # ///
 """Check the installed dashboard with real Alt+A input in an isolated session."""
 
+import argparse
 import json
 import os
 import re
@@ -25,8 +26,15 @@ _SCREENS: dict[int, tuple[pyte.Screen, pyte.Stream]] = {}
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--refresh-only",
+        action="store_true",
+        help="Check refresh and stale entry removal only.",
+    )
+    args = parser.parse_args()
     try:
-        _check_session()
+        _check_session(refresh_only=args.refresh_only)
     finally:
         subprocess.run(
             ["zellij", "delete-session", "--force", SESSION],
@@ -74,7 +82,7 @@ def _screen_text(child: pexpect.spawn, seconds: float = 2) -> str:
     return "\n".join(screen.display)
 
 
-def _check_session() -> None:
+def _check_session(refresh_only: bool = False) -> None:
     child = _attach(True)
     _screen_text(child)
     child.send("\x1b")
@@ -111,8 +119,15 @@ def _check_session() -> None:
         child.send("y")
     before = initial + _screen_text(child)
     assert "running" in before, before
+    _check_refresh(child)
+    if refresh_only:
+        rich.get_console().print(
+            "PASS: r removes stale agents, preserves live agents, and keeps entries cleared after reopening."
+        )
+        return
     child.send("\x1b")
     _screen_text(child)
+    _check_manual_floating_panes(child)
     _cli("action", "new-tab", "--name", "decoy")
     _cli("action", "go-to-tab-by-id", "2")
     _screen_text(child, 1)
@@ -167,9 +182,96 @@ def _check_session() -> None:
     _screen_text(child, 0.2)
     latencies.append(_time_dashboard(child, 2))
     rich.get_console().print(
-        "PASS: Alt+A across tabs with ID gaps, reattachment, and recovery without lifecycle reports.",
+        "PASS: Alt+A preserves manual floating panes, tab ID gaps, reattachment, and agent recovery.",
         f"Opening latency with 8 dashboards: {max(latencies):.3f}s max; {latencies[-1]:.3f}s reopening.",
     )
+
+
+def _check_refresh(child: pexpect.spawn) -> None:
+    _cli(
+        "pipe",
+        "--name",
+        "codex_status",
+        "--",
+        json.dumps(
+            {
+                "id": "closed-agent",
+                "agent": "closed-agent",
+                "worktree": "closed-tab",
+                "status": "idle",
+                "pane_id": 9999999,
+                "tab_id": 9999999,
+            }
+        ),
+    )
+    # PaneUpdate may prune the injected row before input arrives. A report
+    # error persists until refresh, so it also verifies that r was handled.
+    _cli("pipe", "--name", "codex_status", "--", "invalid-json")
+    before = _screen_text(child)
+    assert "invalid status report" in before, before
+    child.send("r")
+    refreshed = _screen_text(child)
+    assert (
+        "closed-agent" not in refreshed and "invalid status report" not in refreshed
+    ), refreshed
+    assert "running" in refreshed and "r: refresh agents" in refreshed, refreshed
+    child.send("\x1b")
+    _screen_text(child, 0.5)
+    child.send("\x1ba")
+    reopened = _screen_text(child)
+    assert "closed-agent" not in reopened and "running" in reopened, reopened
+
+
+def _check_manual_floating_panes(child: pexpect.spawn) -> None:
+    pane_ids = {
+        int(
+            _cli(
+                "action",
+                "new-pane",
+                "--floating",
+                "--name",
+                title,
+                "--",
+                "sleep",
+                "600",
+            )
+            .strip()
+            .removeprefix("terminal_")
+        )
+        for title in ("[host] project / editor", "manual floating shell")
+    }
+    _screen_text(child, 0.5)
+    geometry_keys = ("pane_x", "pane_y", "pane_columns", "pane_rows")
+    originals = {
+        pane["id"]: tuple(pane[key] for key in geometry_keys)
+        for pane in json.loads(_cli("action", "list-panes", "--all", "--json"))
+        if not pane["is_plugin"] and pane["id"] in pane_ids
+    }
+    _cli("action", "hide-floating-panes")
+    for _ in range(2):
+        _screen_text(child, 0.5)
+        child.send("\x1ba")
+        screen = _screen_text(child)
+        assert "TAB" in screen and "target" in screen, screen
+        panes = json.loads(_cli("action", "list-panes", "--all", "--json"))
+        hidden = [p for p in panes if not p["is_plugin"] and p["id"] in pane_ids]
+        assert len(hidden) == 2 and all(p["is_suppressed"] for p in hidden), hidden
+        child.send("\x1b")
+        _screen_text(child, 0.5)
+        panes = json.loads(_cli("action", "list-panes", "--all", "--json"))
+        restored = [p for p in panes if not p["is_plugin"] and p["id"] in pane_ids]
+        assert all(p["is_floating"] and not p["is_suppressed"] for p in restored), (
+            restored
+        )
+        assert all(
+            tuple(p[key] for key in geometry_keys) == originals[p["id"]]
+            for p in restored
+        )
+        assert not json.loads(_cli("action", "current-tab-info", "--json"))[
+            "are_floating_panes_visible"
+        ]
+    for pane_id in pane_ids:
+        _cli("action", "close-pane", "--pane-id", f"terminal_{pane_id}")
 
 
 def _time_dashboard(child: pexpect.spawn, tab_id: int) -> float:
