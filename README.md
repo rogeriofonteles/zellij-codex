@@ -3,6 +3,25 @@
 Codex status badges for Zellij tabs and pane titles, with an optional legacy
 WASM dashboard.
 
+## Choose which feature to run
+
+The two features have separate reporters and state. You can run badges, the
+panel, or both. Installing a WASM file does not start it.
+
+| Feature | Enable | Background activity | Disable |
+| --- | --- | --- | --- |
+| [Tab and pane badges](#status-badges-default) | `./scripts/install`, then review and enable the Codex hooks; install the custom tab bar for Alt+A | Short-lived hook helpers; no resident status monitor | [Disable badge hooks and clear titles](#disable-badges) |
+| [Status panel](#optional-status-panel-legacy-dashboard) | Build/copy `zellij-codex.wasm`, then explicitly launch it | A resident Zellij monitor discovers panes and reads pane content, including while the panel is hidden | [Stop the panel and its monitor](#stop-the-panel-and-its-monitor) |
+
+The full setup below enables badges and reserves **Alt+A for clearing the
+selected pane's done badge**. It does not start the status panel or a remote
+receiver. The optional panel shortcut below is **Ctrl+Alt+D**.
+
+The panel is the legacy dashboard: it has its own colors and acknowledges done
+results when the corresponding pane is viewed. It does not share the badge
+cache or receive the default local lifecycle hooks. Running both does not make
+their status displays identical.
+
 ## Reproduce this setup on another machine
 
 The configuration is versioned here, including the changes that otherwise live
@@ -79,6 +98,8 @@ including the optional workbench arguments if used. To update native tab bars in
 an existing session without restarting terminals, run
 `./scripts/install-tab-bar --session SESSION`. The Ctrl+T, N binding reloads with
 the config; the session's other default-layout settings take effect after restart.
+That command replaces native tab bars; it does not reload an already-running
+custom tab-bar instance. Start a new session to load an updated custom WASM.
 
 ### Existing Codex sessions after a hook upgrade
 
@@ -103,6 +124,8 @@ arrives, `--refresh` only recomputes existing statuses and cannot detect running
 Run `./scripts/install`, then start a new Codex conversation and review its
 updated hooks. No resident monitor, polling, or dashboard is needed.
 The short-lived reporter runs only when a Codex lifecycle hook fires.
+Basic title badges also work with Zellij's native tab bar, without a Rust build.
+The custom tab bar adds pane-specific Alt+A acknowledgment.
 
 | State | Badge |
 | --- | --- |
@@ -131,12 +154,6 @@ terminal-generated OSC titles are overridden by the pane name. Closing or moving
 a pane is reconciled at the next lifecycle report, or immediately with
 `~/.local/bin/zellij-codex-badges --refresh`. State is isolated by the session
 socket identity and updates are serialized across simultaneous hooks.
-
-To disable the legacy dashboard, remove its Alt+A `MessagePlugin` binding and
-the `zellij-codex.wasm` entry with `role "monitor"` from Zellij's `load_plugins`
-configuration, and stop existing dashboard/monitor instances with
-`zellij pipe --name stop_dashboard -- ''` (requires the current WASM build).
-Badge hooks never launch that plugin.
 
 For emoji tab badges with pane-specific Alt+A clearing, build and install the tab bar:
 
@@ -189,34 +206,57 @@ Manual report from a Zellij pane:
 Use `--session NAME --pane-id ID` to target another pane. The existing WASM
 dashboard remains available explicitly through `--plugin /path/to/plugin.wasm`.
 
-## Legacy dashboard requirements
+### Disable badges
+
+In Codex `/hooks`, disable every handler whose command ends in
+`zellij-codex-hook`. Remove those handlers from `~/.codex/hooks.json` (or
+`$CODEX_HOME/hooks.json`) to keep future sessions from loading them; preserve
+unrelated handlers. Refresh already-running Codex sessions as described above.
+
+The launcher also emits an initial badge. In fish, use `command codex` to bypass
+the installed function, or remove `~/.config/fish/functions/codex.fish` (under
+`$XDG_CONFIG_HOME` if set) and run `functions --erase codex` in existing shells.
+In other shells and layouts, invoke Codex directly instead of
+`zellij-codex-launch`.
+
+Disabling hooks does not remove existing prefixes. Clear each affected pane
+with `./scripts/report-status idle --session SESSION --pane-id ID`; list pane
+IDs with `zellij --session SESSION action list-panes --all --json`.
+The tab badge disappears when all its tracked panes are idle. Remove the
+`zellij_codex_clear_done` keybinding if no longer wanted. The custom tab bar can
+remain installed; it does not generate status by itself. To return to Zellij's
+native tab bar, change its alias/layout references to `zellij:tab-bar` and start
+a new session. These steps do not stop the status panel.
+
+## Optional status panel (legacy dashboard)
+
+Use this when you want a floating overview of agents, including reports from
+remote Codex sessions. Leave it stopped when only title badges are needed.
+
+### Requirements
 
 - Zellij 0.44.3 or a compatible release
 - Rust 1.81 or newer
 - Codex CLI 0.147.0 or a hook-compatible release
 - Python 3 for the lifecycle reporter
 
-## Optional legacy dashboard build
+### Enable the panel
 
-Clone the repository, build the WASM plugin, and run the installer:
+From this checkout, build and copy only the panel plugin. These POSIX-shell
+commands do not install or enable badge hooks:
 
 ```sh
-git clone https://github.com/rogeriofonteles/zellij-codex.git
-cd zellij-codex
-
-rustup update stable
 rustup target add wasm32-wasip1
-cargo build --release --target wasm32-wasip1
-./scripts/install
+cargo build --locked --release --target wasm32-wasip1 --bin zellij-codex
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/zellij/plugins"
+cp target/wasm32-wasip1/release/zellij-codex.wasm \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/zellij/plugins/zellij-codex.wasm"
 ```
 
-The installer copies the plugin to Zellij's user configuration directory,
-installs the lifecycle and launch reporters in `~/.local/bin`, installs a fish
-`codex` function, and merges lifecycle handlers into
-`~/.codex/hooks.json` without replacing unrelated hooks. The launch reporter
-makes a pane visible immediately, before Codex creates its conversation ID;
-subsequent lifecycle hooks update that pane's native badge. Automatic hooks now
-target badges; the legacy dashboard can still receive explicit pipe reports.
+If both features are wanted, the full setup already copies this plugin when its
+build artifact exists. Launching it remains a separate step. `./scripts/install`
+registers local lifecycle hooks for badges only; it does not configure dual
+reporting to the panel.
 
 The dashboard also discovers Codex processes from Zellij's live pane list, so
 workbench-created panes appear even if they bypass the launch reporter. A
@@ -228,14 +268,6 @@ workbench does not acknowledge completed results from any other workbench.
 Closing a Codex pane removes its row from the dashboard even when Codex exits
 before its `SessionEnd` hook can report the closure.
 
-Start Codex once after installation. Codex will show a **Hooks need review**
-screen; choose **Trust all and continue** after reviewing the command. New
-Codex conversations opened inside Zellij will then register automatically.
-When the launcher runs in a linked Git worktree, it enables the reviewed hooks
-for that invocation only if the repository's main worktree is explicitly
-trusted. It does not edit Codex's global configuration or extend trust to
-unrelated repositories.
-
 Launch the dashboard as a floating pane from inside a Zellij session:
 
 ```sh
@@ -243,11 +275,14 @@ zellij action launch-plugin --floating -- \
   "file:${XDG_CONFIG_HOME:-$HOME/.config}/zellij/plugins/zellij-codex.wasm"
 ```
 
-To access it directly with `Alt a`, add this binding inside the
+Review its requested permissions. Opening the panel also starts its background
+monitor; hiding or closing the visible panel is not a full shutdown.
+
+To access it directly with `Ctrl+Alt+D`, add this binding inside the
 `shared_except "locked"` block in `~/.config/zellij/config.kdl`:
 
 ```kdl
-bind "Alt a" {
+bind "Ctrl Alt d" {
     MessagePlugin "file:/absolute/path/to/zellij/plugins/zellij-codex.wasm" {
         name "show_dashboard"
         floating false
@@ -260,9 +295,30 @@ The action asks the background plugin to open a centered floating dashboard in
 the active worktree tab. If the Git/Codex view is active, its hidden Neovim
 overlay stays hidden. If Neovim is active, the dashboard appears over it.
 Press `Esc` while the dashboard is focused to restore the previous view; press
-`Alt a` to show it again.
+`Ctrl+Alt+D` to show it again. Keep Alt+A bound to badge acknowledgment.
 
-## Report Codex sessions running over SSH
+### Stop the panel and its monitor
+
+Remove any `zellij-codex.wasm` entry with `role "monitor"` from Zellij's
+`load_plugins` configuration to prevent automatic startup. From the target
+session, stop all panel and monitor instances:
+
+```sh
+zellij pipe --name stop_dashboard -- ''
+```
+
+This requires the current dashboard WASM and leaves badges and the tab bar
+running. Remove its `show_dashboard` shortcut if unwanted. Stop any separately
+started `zellij-codex-receiver` too (Ctrl+C in its terminal, or stop its service),
+because incoming remote reports can launch the panel again. Explicit
+`report-status --plugin ...` reports can also relaunch it.
+
+### Report Codex sessions running over SSH (panel only)
+
+This relay feeds the status panel, not tab/pane badges. It requires a separate
+receiver process and is optional for local use. The local `./scripts/install`
+step also registers badge hooks; use the [disable steps](#disable-badges) if
+only the remote panel is wanted.
 
 Remote Codex hooks cannot use the local Zellij pipe directly. An authenticated
 loopback receiver plus an SSH reverse tunnel bridges them without exposing a
@@ -343,9 +399,10 @@ rustup update stable
 rustup target add wasm32-wasip1
 cargo build --release --target wasm32-wasip1
 zellij action launch-plugin --skip-plugin-cache --floating -- \
-  -- "file:$PWD/target/wasm32-wasip1/release/zellij-codex.wasm"
+  "file:$PWD/target/wasm32-wasip1/release/zellij-codex.wasm"
 ./scripts/report-status running --agent implementation \
-  --worktree grpc-migration --task "Migrating grpc"
+  --worktree grpc-migration --task "Migrating grpc" \
+  --plugin "$PWD/target/wasm32-wasip1/release/zellij-codex.wasm"
 ```
 
 The producer uses Zellij's native pipe transport. Passing `--plugin` addresses
@@ -366,8 +423,8 @@ Implemented now:
 - validation of all seven requested states;
 - multiple agents keyed by Codex session ID;
 - colored terminal rendering;
-- automatic SessionStart, UserPromptSubmit, PermissionRequest, Stop, and
-  SessionEnd lifecycle reporting through `zellij pipe`;
+- explicit pipe reports and optional remote lifecycle reporting; default local
+  lifecycle hooks update native badges only;
 - discovery and removal of workbench-launched Codex panes and unread results;
 - pane and tab tracking for a workbench-aware floating overlay;
 - a manual producer for testing.

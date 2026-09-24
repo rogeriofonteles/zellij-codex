@@ -33,10 +33,18 @@ binding, and optionally installs the workbench layouts. All layouts use the
 custom tab-bar file URL directly; they do not rely on aliases being reloaded
 inside an existing Zellij session. See the README for installation and backups.
 
-## First vertical slice
+## Optional status panel
+
+The panel is the separate `zellij-codex.wasm` binary. Opening it starts a
+background instance with `role "monitor"`, which owns dashboard state and
+subscribes to pane content updates. Hiding the visible panel does not stop this
+monitor; the `stop_dashboard` pipe message stops both. It does not consume the
+badge cache, and local lifecycle hooks do not send it reports. Explicit reports
+and the optional SSH receiver use the pipeline below. Activation and shutdown
+commands are in the README.
 
 ```text
-scripts/report-status
+scripts/report-status --plugin /path/to/zellij-codex.wasm
   -> zellij pipe (name: codex_status, JSON payload)
   -> Zellij WASM plugin pipe() callback
   -> validate + replace one in-memory AgentReport
@@ -50,9 +58,9 @@ Zellij PaneUpdate
   -> clear only results in the active, visibly tiled Git/Codex view
 ```
 
-Zellij's pipe transport is the smallest native boundary: it is session-local,
-does not require a daemon or filesystem polling, and can target a particular
-plugin URL. Live pane discovery covers processes started by layouts and
+Zellij's pipe transport is session-local and can target a particular plugin
+URL. The local panel monitor runs inside Zellij; only remote reporting requires
+a separate receiver process. Live pane discovery covers processes started by layouts and
 workbench launchers, while pane IDs de-duplicate both sources within the
 session. Later, the report envelope should gain a schema version, Zellij
 session, stable agent ID, timestamp, and sequence number.
