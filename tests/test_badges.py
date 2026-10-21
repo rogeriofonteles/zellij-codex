@@ -14,16 +14,16 @@ def test_lifecycle_preserves_names_and_does_not_duplicate_badges() -> None:
         ("running", "[🟠 ↻] "),
         ("input", "[🔴 !] "),
         ("done", "[🔵 ✓] "),
-        ("idle", ""),
+        ("idle", "[⚪ ○] "),
     ]:
         state, actions = BADGES["reconcile"](
             state, panes, {"pane_id": 7, "status": status}
         )
         assert actions == [
             ["rename-pane", "--pane-id", "terminal_7", "--", prefix + "My agent"],
-            ["rename-tab-by-id", "12", "--", prefix + "feature"],
+            ["rename-tab-by-id", "12", "--", ("" if status == "idle" else prefix) + "feature"],
         ]
-        panes[0].update(title=prefix + "My agent", tab_name=prefix + "feature")
+        panes[0].update(title=prefix + "My agent", tab_name=("" if status == "idle" else prefix) + "feature")
         assert (
             BADGES["reconcile"](state, panes, {"pane_id": 7, "status": status})[1] == []
         )
@@ -73,7 +73,7 @@ def test_input_hooks_resume_running_after_answer_or_approval() -> None:
         ("PostToolUse", "request_user_input", "running", "running"),
         ("PreToolUse", "request_user_input_async", "input", "input"),
         ("PostToolUse", "request_user_input_async", "running", "input"),
-        ("Stop", "", "done", "input"),
+        ("Stop", "", "done", "done"),
         ("UserPromptSubmit", "", "running", "running"),
     ]:
         state, _ = BADGES["reconcile"](
@@ -96,18 +96,19 @@ def test_clear_done_only_acknowledges_selected_pane_and_recomputes_tab() -> None
     state = {"statuses": {"7": "done", "8": "done", "10": "done"}}
     state, actions = BADGES["reconcile"](state, panes, {"clear_done_pane_id": 7})
     assert state["statuses"] == {"7": "idle", "8": "done", "10": "done"}
-    assert actions == [["rename-pane", "--pane-id", "terminal_7", "--", "My agent"]]
-    panes[0]["title"] = "My agent"
+    assert actions == [["rename-pane", "--pane-id", "terminal_7", "--", "[⚪ ○] My agent"]]
+    panes[0]["title"] = "[⚪ ○] My agent"
     state, actions = BADGES["reconcile"](state, panes, {"clear_done_pane_id": 8})
     assert state["statuses"] == {"7": "idle", "8": "idle", "10": "done"}
     assert actions == [
-        ["rename-pane", "--pane-id", "terminal_8", "--", "My agent"],
+        ["rename-pane", "--pane-id", "terminal_8", "--", "[⚪ ○] My agent"],
         ["rename-tab-by-id", "12", "--", "feature"],
     ]
-    for status in ("running", "input", "idle"):
+    for status in ("running", "input", "idle", "paused", "error", "stuck"):
         state = {"statuses": {"7": status, "8": "done"}, "waiting": {"7": "question"}}
-        updated, _ = BADGES["reconcile"](state, panes, {"clear_done_pane_id": 7})
+        updated, actions = BADGES["reconcile"](state, panes, {"clear_done_pane_id": 7})
         assert updated == state
+        assert actions == []
 
 
 def test_done_wins_until_prompt_or_acknowledgement_then_running_resumes() -> None:

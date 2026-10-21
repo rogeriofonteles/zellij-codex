@@ -11,6 +11,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).parent))
+import zellij_codex_binding as binding
+
 BADGES = {
     "running": "[🟠 ↻] ",
     "input": "[🔴 !] ",
@@ -18,7 +21,7 @@ BADGES = {
     "stuck": "[🟡 !] ",
     "error": "[🔴 ✕] ",
     "paused": "[🟡 Ⅱ] ",
-    "idle": "",
+    "idle": "[⚪ ○] ",
 }
 PRIORITY = {
     "idle": 0,
@@ -31,18 +34,22 @@ PRIORITY = {
 }
 
 
-def badge_title(title: str, status: str) -> str:
+def badge_title(title: str, status: str | None) -> str:
     for badge in (*BADGES.values(), "[🔴 ↻] ", "[🟡 !] "):
         if badge and title.startswith(badge):
             title = title[len(badge) :]
             break
-    return BADGES[status] + title
+    return (BADGES[status] if status is not None else "") + title
 
 
 def reconcile(
     state: dict[str, Any], panes: list[dict[str, Any]], report: dict[str, Any]
 ) -> tuple[dict[str, Any], list[list[str]]]:
     """Plan only changed titles, resolving pane locations from the live manifest."""
+    if "clear_done_pane_id" in report:
+        selected = str(report["clear_done_pane_id"])
+        if state.get("statuses", {}).get(selected) != "done":
+            return state, []
     live = {str(p["id"]): p for p in panes if not p["is_plugin"] and not p["exited"]}
     statuses = {
         key: value for key, value in state.get("statuses", {}).items() if key in live
@@ -50,6 +57,7 @@ def reconcile(
     waiting = {
         key: value for key, value in state.get("waiting", {}).items() if key in live
     }
+    threads = {key: value for key, value in state.get("threads", {}).items() if key in live}
     clear_pane = str(report.get("clear_done_pane_id", ""))
     if clear_pane in live and statuses.get(clear_pane) == "done":
         statuses[clear_pane] = "idle"
@@ -59,6 +67,7 @@ def reconcile(
         if report.get("remove"):
             statuses.pop(pane_id, None)
             waiting.pop(pane_id, None)
+            threads.pop(pane_id, None)
         elif report.get("status") in BADGES:
             status = report["status"]
             event = report.get("event")
@@ -70,27 +79,28 @@ def reconcile(
                 waiting[pane_id] = tool
             elif event == "PostToolUse" and pending is not None:
                 # Other tools can complete while a question is still open.
-                # An asynchronous question stays open until the next user prompt.
+                # An asynchronous question stays open while the turn is active.
                 if pending != tool or pending.endswith("request_user_input_async"):
                     status = "input"
                 else:
                     waiting.pop(pane_id, None)
-            elif (
-                event == "Stop"
-                and pending is not None
-                and pending.endswith("request_user_input_async")
-            ):
-                status = "input"
             else:
                 waiting.pop(pane_id, None)
             statuses[pane_id] = status
+        if prefix := report.get("binding_prefix"):
+            threads[pane_id] = prefix
+        if "binding_waiting" in report:
+            if report["binding_waiting"] is None:
+                waiting.pop(pane_id, None)
+            else:
+                waiting[pane_id] = report["binding_waiting"]
 
     actions: list[list[str]] = []
     for key, pane in live.items():
         # Recognizing our own prefix also recovers interrupted writes without
         # accumulating badges or taking ownership of unrelated pane titles.
-        title = pane["title"]
-        desired = badge_title(title, statuses.get(key, "idle"))
+        title = (report.get("base_title") or pane["title"]) if key == pane_id else pane["title"]
+        desired = badge_title(title, statuses.get(key))
         if desired != title:
             actions.append(
                 ["rename-pane", "--pane-id", f"terminal_{key}", "--", desired]
@@ -103,10 +113,10 @@ def reconcile(
         if PRIORITY[status] > PRIORITY[tab_statuses[tab_id]]:
             tab_statuses[tab_id] = status
     for tab_id, title in tabs.items():
-        desired = badge_title(title, tab_statuses[tab_id])
+        desired = badge_title(title, None if tab_statuses[tab_id] == "idle" else tab_statuses[tab_id])
         if desired != title:
             actions.append(["rename-tab-by-id", tab_id, "--", desired])
-    return {"statuses": statuses, "waiting": waiting}, actions
+    return {"statuses": statuses, "waiting": waiting, "threads": threads}, actions
 
 
 def main() -> None:
@@ -148,11 +158,21 @@ def main() -> None:
     with (cache / f"{identity}.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = json.loads(path.read_text()) if path.exists() else {}
+        if prefix := report.get("binding_prefix"):
+            # Re-read under the same lock as lifecycle reports. Registration
+            # must not overwrite a newer Stop event with a queued running state.
+            current = binding.read_json(Path(report["binding_path"]))
+            if current.get("prefix") != prefix:
+                return
+            if state.get("threads", {}).get(str(report.get("pane_id"))) != prefix:
+                snapshot = binding.state_for_prefix(prefix)
+                report["status"] = snapshot.get("status", "idle")
+                report["binding_waiting"] = snapshot.get("waiting")
         panes = json.loads(
             subprocess.check_output(
                 [*command, "list-panes", "--all", "--json"],
                 text=True,
-                timeout=2,
+                timeout=5,
             )
         )
         if args.clear_done:
@@ -160,7 +180,7 @@ def main() -> None:
         state, actions = reconcile(state, panes, report)
         for action in actions:
             subprocess.run(
-                [*command, *action], check=True, capture_output=True, timeout=2
+                [*command, *action], check=True, capture_output=True, timeout=5
             )
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(state) + "\n")

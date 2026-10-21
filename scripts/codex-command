@@ -1,0 +1,6 @@
+#!/bin/sh
+# zellij-codex command wrapper
+if [ -n "${ZELLIJ_PANE_ID:-}" ] && [ -n "${ZELLIJ_SESSION_NAME:-}" ]; then
+    exec "$HOME/.local/bin/zellij-codex-launch" "$@"
+fi
+exec "$HOME/.local/bin/codex-real" "$@"

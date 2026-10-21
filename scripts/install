@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import shutil
+import runpy
 from pathlib import Path
 
 EVENTS = (
@@ -41,10 +42,16 @@ def main() -> None:
     shutil.copy2(root / "scripts/codex-badges", badges)
     shutil.copy2(root / "scripts/codex-hook", hook)
     shutil.copy2(root / "scripts/codex-launch", launcher)
+    shutil.copy2(root / "scripts/codex-pty", launcher.with_name("zellij-codex-pty"))
+    shutil.copy2(root / "scripts/zellij_codex_binding.py", launcher.with_name("zellij_codex_binding.py"))
+    runpy.run_path(str(root / "scripts/install-command"))["install_command"](
+        launcher.parent, root / "scripts/codex-command"
+    )
     shutil.copy2(root / "scripts/remote-receiver", receiver)
     hook.chmod(0o755)
     badges.chmod(0o755)
     launcher.chmod(0o755)
+    launcher.with_name("zellij-codex-pty").chmod(0o755)
     receiver.chmod(0o755)
     relay_token.parent.mkdir(parents=True, exist_ok=True)
     if not relay_token.exists():

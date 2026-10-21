@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Forward Codex's terminal, registering its conversation before hiding title metadata."""
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import pty
+import queue
+import re
+import runpy
+import select
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import tty
+
+sys.path.insert(0, str(Path(__file__).parent))
+import zellij_codex_binding as binding
+
+# Codex currently truncates UUID title segments to 29 characters plus '...'.
+# Future versions may send the full UUID. Both contain enough identity to match
+# an actual lifecycle session ID; no title/name or cwd guessing is involved.
+IDENTITY = re.compile(rb'(?<![0-9a-f])([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{5})(?:[0-9a-f]{7}|\.\.\.)')
+
+
+class TitleFilter:
+    def __init__(self, on_title):
+        self.pending = b''
+        self.on_title = on_title
+
+    def feed(self, data):
+        self.pending += data
+        output = bytearray()
+        while self.pending:
+            start = self.pending.find(b'\x1b]')
+            if start < 0:
+                keep = 1 if self.pending.endswith(b'\x1b') else 0
+                output.extend(self.pending[:-keep] if keep else self.pending)
+                self.pending = self.pending[-keep:] if keep else b''
+                break
+            output.extend(self.pending[:start])
+            self.pending = self.pending[start:]
+            endings = [(i, n) for marker, n in ((b'\x07', 1), (b'\x1b\\', 2))
+                       if (i := self.pending.find(marker, 2)) >= 0]
+            if not endings:
+                # Bound buffering of malformed or unrelated terminal sequences.
+                if len(self.pending) > 65536:
+                    output.extend(self.pending)
+                    self.pending = b''
+                break
+            end, length = min(endings)
+            sequence, self.pending = self.pending[:end + length], self.pending[end + length:]
+            body = sequence[2:end]
+            if body.startswith((b'0;', b'2;')):
+                match = IDENTITY.search(body[2:])
+                if match:
+                    title = body[2:]
+                    clean_text = (title[:match.start()] + title[match.end():]).decode('utf-8', errors='replace')
+                    clean_text = re.sub(r'(?<!\S)[\u2800-\u28ff](?=\s*(?:\||$))', '', clean_text)
+                    clean = clean_text.strip(' |').encode('utf-8')
+                    self.on_title(match.group(1).decode(), clean.decode('utf-8'))
+                    sequence = b'\x1b]' + body[:2] + clean + sequence[end:]
+            output.extend(sequence)
+        return bytes(output)
+
+
+def helper(name):
+    local = Path(__file__).with_name(name)
+    return local if local.exists() else Path(__file__).with_name('zellij-' + name)
+
+
+def main():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        os.execv(sys.argv[1], sys.argv[1:])
+    hook = runpy.run_path(str(helper('codex-hook')))
+    session = os.environ['ZELLIJ_SESSION_NAME']
+    pane = os.environ['ZELLIJ_PANE_ID']
+    socket = hook['session_socket_identity'](session)
+    if not socket:
+        os.execv(sys.argv[1], sys.argv[1:])
+    key = hashlib.sha256(f'{socket}:{pane}'.encode()).hexdigest()
+    path = binding.root() / 'bindings' / f'{key}.json'
+    owner = binding.owner_token(os.getpid())
+    jobs = queue.Queue()
+    last = None
+
+    def on_title(prefix, title):
+        nonlocal last
+        if (prefix, title) == last:
+            return
+        last = (prefix, title)
+        binding.atomic_json(path, {'prefix': prefix, 'session': session, 'pane': pane,
+                                  'socket': socket, 'pid': os.getpid(), 'owner': owner,
+                                  'title': title})
+        jobs.put((prefix, title))
+
+    def report_titles():
+        while True:
+            job = jobs.get()
+            if job is None:
+                return
+            prefix, title = job
+            if job != last:
+                continue
+            report = {'pane_id': int(pane), 'base_title': title,
+                      'binding_prefix': prefix, 'binding_path': str(path)}
+            try:
+                subprocess.run([sys.executable, str(helper('codex-badges')), '--session', session],
+                               input=json.dumps(report), text=True, timeout=30,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    original = termios.tcgetattr(0)
+    size = fcntl.ioctl(0, termios.TIOCGWINSZ, b'\0' * 8)
+    child, master = pty.fork()
+    if child == 0:
+        fcntl.ioctl(0, termios.TIOCSWINSZ, size)
+        os.execv(sys.argv[1], [sys.argv[1], '-c',
+            'tui.terminal_title=["thread-id","thread-name","project-name"]', *sys.argv[2:]])
+
+    threading.Thread(target=report_titles, daemon=True).start()
+
+    def resize(*_):
+        try:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, fcntl.ioctl(0, termios.TIOCGWINSZ, b'\0' * 8))
+        except OSError:
+            pass
+
+    def forward(signum, _):
+        try:
+            os.kill(child, signum)
+        except ProcessLookupError:
+            pass
+
+    signal.signal(signal.SIGWINCH, resize)
+    for signum in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(signum, forward)
+    parser = TitleFilter(on_title)
+    try:
+        tty.setraw(0)
+        while True:
+            ready, _, _ = select.select([0, master], [], [])
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                output = parser.feed(data)
+                if output:
+                    write_all(1, output)
+            if 0 in ready:
+                data = os.read(0, 65536)
+                if not data:
+                    os.kill(child, signal.SIGHUP)
+                    break
+                write_all(master, data)
+    finally:
+        termios.tcsetattr(0, termios.TCSADRAIN, original)
+        os.close(master)
+        if binding.read_json(path).get('pid') == os.getpid():
+            path.unlink(missing_ok=True)
+            try:
+                subprocess.run([sys.executable, str(helper('codex-badges')), '--session', session],
+                               input=json.dumps({'pane_id': int(pane), 'remove': True}),
+                               text=True, timeout=20, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    _, status = os.waitpid(child, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+def write_all(fd, data):
+    while data:
+        count = os.write(fd, data)
+        data = data[count:]
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

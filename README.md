@@ -10,7 +10,7 @@ panel, or both. Installing a WASM file does not start it.
 
 | Feature | Enable | Background activity | Disable |
 | --- | --- | --- | --- |
-| [Tab and pane badges](#status-badges-default) | `./scripts/install`, then review and enable the Codex hooks; install the custom tab bar for Alt+A | Short-lived hook helpers; no resident status monitor | [Disable badge hooks and clear titles](#disable-badges) |
+| [Tab and pane badges](#status-badges-default) | `./scripts/install`, then review and enable the Codex hooks; install the custom tab bar for Alt+A | Lifecycle hooks and a terminal bridge per client; no screen polling | [Disable badge hooks and clear titles](#disable-badges) |
 | [Status panel](#optional-status-panel-legacy-dashboard) | Build/copy `zellij-codex.wasm`, then explicitly launch it | A resident Zellij monitor discovers panes and reads pane content, including while the panel is hidden | [Stop the panel and its monitor](#stop-the-panel-and-its-monitor) |
 
 The full setup below enables badges and reserves **Alt+A for clearing the
@@ -54,8 +54,34 @@ session state, and compiled plugins are not copied from another machine.
 
 Start a new Zellij session for the complete setup. Review and allow the tab-bar
 plugin's permissions (read state, change state, run commands), then start Codex
-and review its hooks with `/hooks`. The installed fish `codex` function uses
-the launch wrapper; in other shells run `zellij-codex-launch` explicitly.
+and review its hooks with `/hooks`. The installer wraps `~/.local/bin/codex`,
+preserving the original executable or symlink as `~/.local/bin/codex-real`.
+With `~/.local/bin` first on `PATH`, every shell uses automatic pane registration
+inside Zellij. Outside Zellij, the wrapper directly starts the original binary.
+The fish function and `zellij-codex-launch` remain supported entry points.
+
+### Shared-server conversations
+
+New interactive launches use a small PTY bridge while retaining the shared Codex
+server. It asks Codex to include its conversation identifier in terminal-title
+updates, registers that identifier with the current pane, and removes it before
+forwarding the title to the terminal. Badges continue to come from lifecycle
+events, not screen-text guesses. New conversations, resume, fork, and conversation
+switches update the mapping automatically, in both existing and new Zellij sessions.
+If the same conversation is open in two panes, both receive its lifecycle events.
+
+The bridge reserves terminal-title configuration for this integration; titles show
+the conversation name and project. `/title` customization can remove the identity
+field and disable automatic mapping for subsequent conversation switches. Use the
+normal launcher again to restore it. The bridge requires Linux `/proc` for process
+ownership validation and a Codex version supporting `tui.terminal_title` with the
+`thread-id` item (tested with 0.162.0).
+
+`codex-latex` should run `zellij-codex-launch` inside its rendering bridge with its
+own runtime binary first on `PATH`. This preserves LaTeX rendering and registers
+the actual displayed conversation. Already-running clients must be relaunched to
+load the terminal bridge; their previously registered conversation mappings keep
+working in the meantime. A Zellij restart is not needed.
 
 | Versioned file | Installed destination / purpose |
 | --- | --- |
@@ -119,17 +145,25 @@ option is to exit and resume Codex after its current task finishes.
 The badge reporter does not infer status from screen text: if no lifecycle event
 arrives, `--refresh` only recomputes existing statuses and cannot detect running work.
 
+On Linux, hooks with a sanitized environment recover the pane identity from
+their nearest parent Codex process through `/proc`. This works with PTY wrappers
+such as `codex-latex`, even when Zellij omits pane commands and working directories.
+Only Zellij identity variables are restored; unrelated process environment values
+are not copied. Wrappers should also invoke `zellij-codex-launch` with their Codex
+binary first on `PATH` to register the pane before the first lifecycle event.
+
 ## Status badges (default)
 
 Run `./scripts/install`, then start a new Codex conversation and review its
 updated hooks. No resident monitor, polling, or dashboard is needed.
-The short-lived reporter runs only when a Codex lifecycle hook fires.
+The reporter runs when a Codex lifecycle hook fires or a client changes its
+conversation/title. The terminal bridge forwards input, output, and resize events.
 Basic title badges also work with Zellij's native tab bar, without a Rust build.
 The custom tab bar adds pane-specific Alt+A acknowledgment.
 
 | State | Badge |
 | --- | --- |
-| Idle | Original title, no badge |
+| Idle | `[⚪ ○]` on tracked panes; no tab badge |
 | Running | `[🟠 ↻]` |
 | Waiting for input or approval | `[🔴 !]` |
 | Done | `[🔵 ✓]` |
@@ -213,14 +247,14 @@ In Codex `/hooks`, disable every handler whose command ends in
 `$CODEX_HOME/hooks.json`) to keep future sessions from loading them; preserve
 unrelated handlers. Refresh already-running Codex sessions as described above.
 
-The launcher also emits an initial badge. In fish, use `command codex` to bypass
-the installed function, or remove `~/.config/fish/functions/codex.fish` (under
-`$XDG_CONFIG_HOME` if set) and run `functions --erase codex` in existing shells.
-In other shells and layouts, invoke Codex directly instead of
-`zellij-codex-launch`.
+To bypass registration, run `~/.local/bin/codex-real` directly. To uninstall the
+command wrapper, restore that preserved executable as `~/.local/bin/codex` and
+remove `~/.config/fish/functions/codex.fish` (under `$XDG_CONFIG_HOME` if set).
+Run `functions --erase codex` in existing fish shells. Stop using
+`zellij-codex-launch` in layouts and other wrappers as well.
 
 Disabling hooks does not remove existing prefixes. Clear each affected pane
-with `./scripts/report-status idle --session SESSION --pane-id ID`; list pane
+by sending a removal report: `echo '{"pane_id":ID,"remove":true}' | zellij-codex-badges --session SESSION` (replace `ID` with the numeric pane ID); list pane
 IDs with `zellij --session SESSION action list-panes --all --json`.
 The tab badge disappears when all its tracked panes are idle. Remove the
 `zellij_codex_clear_done` keybinding if no longer wanted. The custom tab bar can

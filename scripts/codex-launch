@@ -109,7 +109,7 @@ def _list_panes() -> list[dict[str, object]]:
             check=False,
             capture_output=True,
             text=True,
-            timeout=1,
+            timeout=5,
         )
         panes = json.loads(result.stdout) if result.returncode == 0 else []
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -248,7 +248,7 @@ def report_launch(pane: str, tab_id: int | None, tab_position: int | None) -> No
             input=json.dumps(payload),
             text=True,
             check=False,
-            timeout=5,
+            timeout=20,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -261,11 +261,60 @@ def main() -> None:
     cwd = Path.cwd()
     pane, tab_id, tab_position = pane_context(cwd)
     configure_pane_identity(pane, tab_id, tab_position)
-    report_launch(pane, tab_id, tab_position)
+    use_bridge = uses_terminal_bridge(sys.argv[1:])
+    if use_bridge:
+        report_launch(pane, tab_id, tab_position)
     executable = shutil.which("codex")
     if not executable:
         raise SystemExit("codex executable not found")
-    os.execv(executable, ["codex", *codex_arguments(sys.argv[1:], cwd)])
+    executable = real_executable(executable)
+    args = codex_arguments(sys.argv[1:], cwd)
+    if pane and os.environ.get("ZELLIJ_SESSION_NAME") and use_bridge:
+        os.environ["ZELLIJ_PANE_ID"] = pane
+        bridge = Path(__file__).with_name("codex-pty")
+        if not bridge.exists():
+            bridge = Path(__file__).with_name("zellij-codex-pty")
+        os.execv(sys.executable, [sys.executable, str(bridge), executable, *args])
+    os.execv(executable, ["codex", *args])
+
+
+def real_executable(executable: str) -> str:
+    installed = Path.home() / ".local/bin/codex"
+    if Path(executable).absolute() == installed and installed.is_file():
+        with installed.open("rb") as stream:
+            managed = b"zellij-codex command wrapper" in stream.read(128)
+        if managed:
+            preserved = installed.with_name("codex-real")
+            if not preserved.exists():
+                raise SystemExit("Missing preserved Codex executable: " + str(preserved))
+            return str(preserved.resolve())
+    return executable
+
+
+def uses_terminal_bridge(args: list[str]) -> bool:
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    if any(arg in ("--help", "-h", "--version", "-V") for arg in args):
+        return False
+    commands = {"exec", "e", "review", "login", "logout", "mcp", "plugin",
+                "app-server", "remote-control", "app", "completion", "update", "doctor",
+                "sandbox", "debug", "execpolicy", "apply", "a", "queue", "archive",
+                "delete", "migrate-rollouts", "unarchive", "cloud", "cloud-tasks",
+                "responses-api-proxy", "stdio-to-uds", "tcp-tunnel", "features"}
+    values = {"-c", "--config", "--enable", "--disable", "-i", "--image", "-m", "--model",
+              "--local-provider", "-p", "--profile", "-s", "--sandbox", "-C", "--cd",
+              "--add-dir", "-a", "--ask-for-approval", "--remote", "--remote-auth-token-env"}
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg == "--":
+            return True
+        elif arg in values:
+            skip = True
+        elif not arg.startswith("-"):
+            return arg not in commands
+    return True
 
 
 if __name__ == "__main__":

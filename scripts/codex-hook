@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Translate a Codex lifecycle hook on stdin into a Zellij agent report."""
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import zellij_codex_binding as binding
 
 
 def status_for(event: str, payload: dict | None = None) -> str:
@@ -33,6 +37,45 @@ def task_for(event: str, payload: dict) -> str:
     if event == "SessionEnd":
         return f"Session ended: {payload.get('reason', 'unknown')}"
     return "New Codex conversation"
+
+
+def restore_pane_environment(proc_root: Path = Path("/proc")) -> None:
+    """Recover only the owning Codex process's pane, never a same-cwd guess.
+
+    Hook runners can supply a sanitized environment. On Linux the parent
+    Codex still has its original launch environment, including inside a PTY
+    bridge such as codex-latex. Stop at the nearest Codex, even if it has no
+    pane (for example the desktop app).
+    """
+    if os.environ.get("ZELLIJ_SESSION_NAME") and os.environ.get("ZELLIJ_PANE_ID"):
+        return
+    pid = os.getppid()
+    seen = set()
+    for _ in range(32):
+        if pid <= 1 or pid in seen:
+            return
+        seen.add(pid)
+        process = proc_root / str(pid)
+        try:
+            executable = (process / "exe").readlink().name.removesuffix(" (deleted)")
+            if executable == "codex":
+                environment = dict(
+                    item.split("=", 1)
+                    for item in (process / "environ").read_text().split("\0")
+                    if "=" in item
+                )
+                session = environment.get("ZELLIJ_SESSION_NAME", "")
+                pane = environment.get("ZELLIJ_PANE_ID", "")
+                if session and pane.isdigit():
+                    os.environ["ZELLIJ_SESSION_NAME"] = session
+                    os.environ["ZELLIJ_PANE_ID"] = pane
+                    os.environ["ZELLIJ_CODEX_PANE_ID"] = pane
+                    if socket_dir := environment.get("ZELLIJ_SOCKET_DIR"):
+                        os.environ["ZELLIJ_SOCKET_DIR"] = socket_dir
+                return
+            pid = int((process / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return
 
 
 def restore_zellij_socket_dir() -> str | None:
@@ -89,7 +132,14 @@ def pane_context(cwd: Path) -> tuple[str, str, int | None, int | None]:
         if (
             not pane_info.get("is_plugin", False)
             and not pane_info.get("exited", False)
-            and _pane_cwd(pane_info) == cwd.resolve()
+            and (
+                _pane_cwd(pane_info) == cwd.resolve()
+                or (
+                    _pane_cwd(pane_info) is None
+                    and bool(requested_session)
+                    and pane.isdigit()
+                )
+            )
             and (
                 pane_info.get("id") == int(pane)
                 if pane.isdigit()
@@ -132,7 +182,7 @@ def _list_sessions() -> list[str]:
             check=False,
             capture_output=True,
             text=True,
-            timeout=1,
+            timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
@@ -152,7 +202,7 @@ def _list_panes(session: str) -> list[dict[str, object]]:
             check=False,
             capture_output=True,
             text=True,
-            timeout=1,
+            timeout=5,
         )
         panes = json.loads(result.stdout) if result.returncode == 0 else []
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -187,6 +237,70 @@ def _environment_int(name: str) -> int | None:
     return int(value) if value.isdigit() else None
 
 
+def session_socket_identity(session: str) -> str | None:
+    directories = _zellij_socket_dir_candidates()
+    if directory := os.environ.get("ZELLIJ_SOCKET_DIR"):
+        directories.insert(0, Path(directory))
+    for directory in directories:
+        for contract in directory.glob("contract_version_*"):
+            socket = contract / session
+            try:
+                if socket.is_socket():
+                    stat = socket.stat()
+                    return f"{socket.resolve()}:{stat.st_ino}:{stat.st_mtime_ns}"
+            except OSError:
+                continue
+    return None
+
+
+def session_pane_context(cwd: Path, session_id: str) -> tuple[str, str, int | None, int | None]:
+    bindings = [item for item in binding.active_bindings()
+                if item.get("socket") == session_socket_identity(item.get("session", ""))]
+    matches = [item for item in bindings
+               if len(item.get("prefix", "")) >= 29 and session_id.startswith(item["prefix"])]
+    if matches:
+        # One conversation may be open in more than one client. Do not guess
+        # which pane should own it when the hook lacks an explicit pane.
+        if len(matches) != 1:
+            return "", "", None, None
+        item = matches[0]
+        for pane in _list_panes(item["session"]):
+            if (str(pane.get("id")) == item["pane"] and not pane.get("is_plugin")
+                    and not pane.get("exited")):
+                return item["session"], item["pane"], pane.get("tab_id"), pane.get("tab_position")
+        return "", "", None, None
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "zellij-codex/identities"
+    path = cache / (hashlib.sha256(session_id.encode()).hexdigest() + ".json")
+    try:
+        saved = json.loads(path.read_text())
+    except (OSError, ValueError):
+        saved = None
+    if saved and any(item.get("session") == saved.get("session")
+                     and item.get("pane") == saved.get("pane") for item in bindings):
+        # The client switched conversations. Its former identity must not
+        # update this pane when a background turn completes in the daemon.
+        return "", "", None, None
+    if saved and not os.environ.get("ZELLIJ_PANE_ID"):
+        session = saved["session"]
+        if saved["socket"] == session_socket_identity(session):
+            for pane in _list_panes(session):
+                if (str(pane.get("id")) == saved["pane"]
+                    and not pane.get("is_plugin") and not pane.get("exited")
+                    and _pane_cwd(pane) in (None, cwd.resolve())):
+                    return session, saved["pane"], pane.get("tab_id"), pane.get("tab_position")
+    context = pane_context(cwd)
+    session, pane, _, _ = context
+    if pane and (identity := session_socket_identity(session)):
+        try:
+            cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with tempfile.NamedTemporaryFile(mode="w", dir=cache, delete=False) as temporary:
+                json.dump({"session": session, "pane": pane, "socket": identity}, temporary)
+            os.replace(temporary.name, path)
+        except OSError:
+            pass
+    return context
+
+
 def main() -> int:
     try:
         payload = json.load(sys.stdin)
@@ -195,11 +309,40 @@ def main() -> int:
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return 0
 
+    binding.record_event(session_id, event, str(payload.get("tool_name", "")))
+    restore_pane_environment()
     restore_zellij_socket_dir()
     cwd = Path(str(payload.get("cwd") or os.getcwd()))
-    zellij_session, pane, tab_id, tab_position = pane_context(cwd)
-    if not pane:
-        return 0
+    contexts = active_pane_contexts(session_id)
+    if not contexts:
+        contexts = [session_pane_context(cwd, session_id)]
+    for context in contexts:
+        if context[1]:
+            send_report(payload, event, session_id, cwd, context)
+    return 0
+
+
+def active_pane_contexts(session_id):
+    contexts = []
+    manifests = {}
+    for item in binding.active_bindings():
+        prefix = item.get("prefix", "")
+        session = item.get("session", "")
+        if len(prefix) < 29 or not session_id.startswith(prefix):
+            continue
+        if item.get("socket") != session_socket_identity(session):
+            continue
+        if session not in manifests:
+            manifests[session] = _list_panes(session)
+        for pane in manifests[session]:
+            if (str(pane.get("id")) == item.get("pane") and not pane.get("is_plugin")
+                    and not pane.get("exited")):
+                contexts.append((session, item["pane"], pane.get("tab_id"), pane.get("tab_position")))
+    return list(dict.fromkeys(contexts))
+
+
+def send_report(payload, event, session_id, cwd, context):
+    zellij_session, pane, tab_id, tab_position = context
     report = {
         # The pane identity is available before Codex creates a session. This
         # lets a launch report and later lifecycle hooks update the same row.
@@ -231,7 +374,7 @@ def main() -> int:
             input=json.dumps(report),
             text=True,
             check=False,
-            timeout=5,
+            timeout=20,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

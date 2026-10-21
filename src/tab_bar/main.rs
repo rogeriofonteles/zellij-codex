@@ -50,11 +50,6 @@ impl ZellijPlugin for State {
             .get("replace_pane_id")
             .and_then(|id| id.parse().ok());
         self.badge_command = configuration.get("badge_command").cloned();
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::ChangeApplicationState,
-            PermissionType::RunCommands,
-        ]);
         self.hide_swap_layout_indication = configuration
             .get("hide_swap_layout_indication")
             .map(|s| s == "true")
@@ -67,6 +62,11 @@ impl ZellijPlugin for State {
             EventType::PaneUpdate,
             EventType::PermissionRequestResult,
             EventType::RunCommandResult,
+        ]);
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+            PermissionType::RunCommands,
         ]);
     }
 
@@ -178,7 +178,7 @@ impl ZellijPlugin for State {
             return false;
         }
         // Broadcast keybindings reach every tab bar; only the current tab handles this one.
-        let Some(tab) = self
+        let Some(_tab) = self
             .tabs
             .iter()
             .find(|tab| tab.active && Some(tab.position) == self.own_tab_position)
@@ -188,17 +188,12 @@ impl ZellijPlugin for State {
         let Some(session) = self.mode_info.session_name.as_deref() else {
             return false;
         };
-        let Some(pane) = self.panes.panes.get(&tab.position).and_then(|panes| {
-            panes.iter().find(|pane| {
-                pane.is_focused
-                    && !pane.is_plugin
-                    && !pane.is_suppressed
-                    && pane.is_floating == tab.are_floating_panes_visible
-            })
-        }) else {
+        // PaneManifest can mark panes focused for multiple attached clients.
+        // Query this plugin client's actual focus instead of taking the first match.
+        let Ok((_, PaneId::Terminal(pane_id))) = get_focused_pane_info() else {
             return false;
         };
-        let pane_id = pane.id.to_string();
+        let pane_id = pane_id.to_string();
         let mut command = match self.badge_command.as_deref() {
             Some(command) => vec![command],
             None => vec![

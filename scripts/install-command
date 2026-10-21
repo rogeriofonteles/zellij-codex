@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Install shell-independent Codex dispatch, preserving the original executable."""
+from pathlib import Path
+import shutil
+
+
+def install_command(bin_dir: Path, source: Path) -> None:
+    command = bin_dir / 'codex'
+    original = bin_dir / 'codex-real'
+    managed = False
+    if command.is_file() and not command.is_symlink():
+        with command.open('rb') as stream:
+            managed = b'zellij-codex command wrapper' in stream.read(128)
+    if not managed:
+        if original.exists() or original.is_symlink():
+            raise RuntimeError(f'Refusing to overwrite existing {original}')
+        if command.exists() or command.is_symlink():
+            command.rename(original)
+        else:
+            executable = shutil.which('codex')
+            if not executable:
+                raise RuntimeError('Install Codex first')
+            original.symlink_to(Path(executable).absolute())
+    temporary = command.with_suffix('.zellij-new')
+    shutil.copyfile(source, temporary)
+    temporary.chmod(0o755)
+    temporary.replace(command)
+
+
+if __name__ == '__main__':
+    install_command(Path.home() / '.local/bin', Path(__file__).with_name('codex-command'))
