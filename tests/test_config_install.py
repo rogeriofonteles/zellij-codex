@@ -43,6 +43,7 @@ def test_install_portable_config_and_preserve_original(
     assert ('bind "Ctrl k"' in installed) == with_workbench
     assert ('bind "Alt t"' in installed) == with_workbench
     assert 'bind "n"' in installed and 'bind "Alt a"' in installed
+    assert 'bind "Alt s"' in installed
     if with_workbench:
         assert (
             config_dir / "plugins/zellij-worktree.wasm"

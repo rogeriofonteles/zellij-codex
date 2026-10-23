@@ -356,6 +356,7 @@ def send_report(payload, event, session_id, cwd, context):
         "agent": f"codex-{pane}" if pane else f"codex-{session_id[:8]}",
         "status": status_for(event, payload),
         "event": event,
+        "thread_id": session_id,
         "tool_name": str(payload.get("tool_name", "")),
         "task": task_for(event, payload),
         "worktree": cwd.name,

@@ -18,9 +18,10 @@ BADGES = {
     "running": "[🟠 ↻] ",
     "input": "[🔴 !] ",
     "done": "[🔵 ✓] ",
+    "hold": "[🟡 ⚑] ",
     "stuck": "[🟡 !] ",
     "error": "[🔴 ✕] ",
-    "paused": "[🟡 Ⅱ] ",
+    "paused": "[🟡 ⚑] ",
     "idle": "[⚪ ○] ",
 }
 PRIORITY = {
@@ -35,7 +36,7 @@ PRIORITY = {
 
 
 def badge_title(title: str, status: str | None) -> str:
-    for badge in (*BADGES.values(), "[🔴 ↻] ", "[🟡 !] "):
+    for badge in (*BADGES.values(), "[🔴 ↻] ", "[🟡 !] ", "[🟡 Ⅱ] ", "[🟡 Ⅱ ] ", "[🟡⏸︎] ", "[🟡⏸] ", "[🟡‖] "):
         if badge and title.startswith(badge):
             title = title[len(badge) :]
             break
@@ -48,7 +49,10 @@ def reconcile(
     """Plan only changed titles, resolving pane locations from the live manifest."""
     if "clear_done_pane_id" in report:
         selected = str(report["clear_done_pane_id"])
-        if state.get("statuses", {}).get(selected) != "done":
+        if (
+            state.get("statuses", {}).get(selected) != "done"
+            and selected not in state.get("on_hold", [])
+        ):
             return state, []
     live = {str(p["id"]): p for p in panes if not p["is_plugin"] and not p["exited"]}
     statuses = {
@@ -58,12 +62,26 @@ def reconcile(
         key: value for key, value in state.get("waiting", {}).items() if key in live
     }
     threads = {key: value for key, value in state.get("threads", {}).items() if key in live}
+    on_hold = set(state.get("on_hold", [])) & live.keys()
     clear_pane = str(report.get("clear_done_pane_id", ""))
-    if clear_pane in live and statuses.get(clear_pane) == "done":
+    if clear_pane in live and clear_pane in on_hold:
+        on_hold.discard(clear_pane)
+        statuses.pop(clear_pane, None)
+        waiting.pop(clear_pane, None)
+    elif clear_pane in live and statuses.get(clear_pane) == "done":
         statuses[clear_pane] = "idle"
         waiting.pop(clear_pane, None)
+    hold_pane = str(report.get("toggle_hold_pane_id", ""))
+    if hold_pane in statuses:
+        on_hold.symmetric_difference_update({hold_pane})
     pane_id = str(report.get("pane_id", ""))
     if pane_id in live:
+        if (
+            report.get("remove")
+            or report.get("event") in ("UserPromptSubmit", "SessionStart")
+            or (report.get("binding_prefix") and report["binding_prefix"] != threads.get(pane_id))
+        ):
+            on_hold.discard(pane_id)
         if report.get("remove"):
             statuses.pop(pane_id, None)
             waiting.pop(pane_id, None)
@@ -100,7 +118,7 @@ def reconcile(
         # Recognizing our own prefix also recovers interrupted writes without
         # accumulating badges or taking ownership of unrelated pane titles.
         title = (report.get("base_title") or pane["title"]) if key == pane_id else pane["title"]
-        desired = badge_title(title, statuses.get(key))
+        desired = badge_title(title, "hold" if key in on_hold else statuses.get(key))
         if desired != title:
             actions.append(
                 ["rename-pane", "--pane-id", f"terminal_{key}", "--", desired]
@@ -109,6 +127,8 @@ def reconcile(
     tabs = {str(p["tab_id"]): p["tab_name"] for p in panes}
     tab_statuses = dict.fromkeys(tabs, "idle")
     for key, status in statuses.items():
+        if key in on_hold or status == "hold":
+            continue
         tab_id = str(live[key]["tab_id"])
         if PRIORITY[status] > PRIORITY[tab_statuses[tab_id]]:
             tab_statuses[tab_id] = status
@@ -116,7 +136,10 @@ def reconcile(
         desired = badge_title(title, None if tab_statuses[tab_id] == "idle" else tab_statuses[tab_id])
         if desired != title:
             actions.append(["rename-tab-by-id", tab_id, "--", desired])
-    return {"statuses": statuses, "waiting": waiting, "threads": threads}, actions
+    updated: dict[str, Any] = {"statuses": statuses, "waiting": waiting, "threads": threads}
+    if on_hold:
+        updated["on_hold"] = sorted(on_hold)
+    return updated, actions
 
 
 def main() -> None:
@@ -126,7 +149,7 @@ def main() -> None:
         "--pane-id",
         type=int,
         default=os.environ.get("ZELLIJ_PANE_ID"),
-        help="Terminal pane ID for --clear-done (defaults to this pane).",
+        help="Terminal pane ID for --clear-done or --toggle-hold (defaults to this pane).",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -137,16 +160,21 @@ def main() -> None:
     mode.add_argument(
         "--clear-done",
         action="store_true",
-        help="Clear this pane's completed badge, preserving running and input states.",
+        help="Clear this pane's completed or hold badge, preserving other states.",
+    )
+    mode.add_argument(
+        "--toggle-hold",
+        action="store_true",
+        help="Toggle a pane-only yellow hold badge on this tracked pane.",
     )
     args = parser.parse_args()
-    if args.clear_done and args.pane_id is None:
-        parser.error("--clear-done requires --pane-id or ZELLIJ_PANE_ID")
+    if (args.clear_done or args.toggle_hold) and args.pane_id is None:
+        parser.error("--clear-done and --toggle-hold require --pane-id or ZELLIJ_PANE_ID")
     if not args.session:
         raise SystemExit(
             "A Zellij session is required (--session or ZELLIJ_SESSION_NAME)."
         )
-    report = {} if args.refresh or args.clear_done else json.load(sys.stdin)
+    report = {} if args.refresh or args.clear_done or args.toggle_hold else json.load(sys.stdin)
     command = ["zellij", "--session", args.session, "action"]
     cache = (
         Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -158,6 +186,22 @@ def main() -> None:
     with (cache / f"{identity}.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = json.loads(path.read_text()) if path.exists() else {}
+        if thread_id := report.get("thread_id"):
+            clients = [
+                item for item in binding.active_bindings()
+                if item.get("session") == args.session
+                and str(item.get("pane")) == str(report.get("pane_id"))
+                and hashlib.sha256(item.get("socket", "").encode()).hexdigest() == identity
+            ]
+            if clients:
+                # Hooks can outlive the conversation displayed by their client.
+                # The title registration will recover a new thread's pending events.
+                if not any(thread_id.startswith(item["prefix"]) for item in clients):
+                    return
+                if report.get("event") == "SessionEnd":
+                    # The terminal bridge owns removal while its client is attached.
+                    report["remove"] = False
+                    report["status"] = "idle"
         if prefix := report.get("binding_prefix"):
             # Re-read under the same lock as lifecycle reports. Registration
             # must not overwrite a newer Stop event with a queued running state.
@@ -177,6 +221,8 @@ def main() -> None:
         )
         if args.clear_done:
             report["clear_done_pane_id"] = args.pane_id
+        if args.toggle_hold:
+            report["toggle_hold_pane_id"] = args.pane_id
         state, actions = reconcile(state, panes, report)
         for action in actions:
             subprocess.run(

@@ -56,9 +56,10 @@ def main() -> None:
         )
         helper.chmod(0o755)
         config.write_text(
-            'default_shell "/bin/bash"\nshow_startup_tips false\nshow_release_notes false\n'
+            'default_shell "/bin/bash"\npane_frames true\nshow_startup_tips false\nshow_release_notes false\n'
             'keybinds {\nshared_except "locked" {\nbind "Alt a" {\n'
-            'MessagePlugin {\nname "zellij_codex_clear_done"\n}\n}\n}\n}\n'
+            'MessagePlugin {\nname "zellij_codex_clear_done"\n}\n}\n'
+            'bind "Alt s" {\nMessagePlugin {\nname "zellij_codex_toggle_hold"\n}\n}\n}\n}\n'
         )
         env = {
             key: value
@@ -164,7 +165,7 @@ def main() -> None:
                 ("PermissionRequest", "[🔴 !] "),
                 ("PostToolUse", "[🟠 ↻] "),
                 ("Stop", "[🔵 ✓] "),
-                ("SessionStart", ""),
+                ("SessionStart", "[⚪ ○] "),
             ]:
                 hook = subprocess.Popen(
                     [sys.executable, str(root / "scripts/codex-hook")],
@@ -197,15 +198,14 @@ def main() -> None:
                     p for p in panes if not p["is_plugin"] and p["id"] == pane_id
                 )
                 assert actual["title"] == prefix + "Badge pane", actual
-                assert actual["tab_name"] == prefix + "Badge tab", actual
+                tab_prefix = "" if event == "SessionStart" else prefix
+                assert actual["tab_name"] == tab_prefix + "Badge tab", actual
                 assert not any(
                     (p.get("plugin_url") or "").endswith("/zellij-codex.wasm")
                     for p in panes
                 )
-                rendered = "\n".join(screen.display)
-                assert prefix + "Badge pane" in rendered, rendered
                 row = screen.display[0]
-                title = prefix + "Badge tab"
+                title = tab_prefix + "Badge tab"
                 assert title in row, row
                 column = row.index(title)
                 assert screen.buffer[0][column].bg == native_title_style.bg, row
@@ -213,6 +213,29 @@ def main() -> None:
                 rich.get_console().print(
                     f"PASS {event}: tab and pane {prefix or '(idle)'}"
                 )
+                if event == "Stop":
+                    for keys, pane_prefix, tab_prefix in (
+                        ("\x1bs", "[🟡 ⚑] ", ""),
+                        ("\x1bs", "[🔵 ✓] ", "[🔵 ✓] "),
+                        ("\x1bs", "[🟡 ⚑] ", ""),
+                        ("\x1ba", "", ""),
+                    ):
+                        child.send(keys)
+                        deadline = time.monotonic() + 5
+                        while True:
+                            _drain(child, stream, duration=0.1)
+                            current = json.loads(subprocess.check_output(
+                                [*command, "list-panes", "--all", "--json"], env=env
+                            ))
+                            actual = next(p for p in current if not p["is_plugin"] and p["id"] == pane_id)
+                            if (actual["title"] == pane_prefix + "Badge pane"
+                                    and actual["tab_name"] == tab_prefix + "Badge tab"):
+                                break
+                            assert time.monotonic() < deadline, actual
+                        assert actual["is_focused"] and len(current) == len(panes), current
+                    rich.get_console().print(
+                        "PASS Alt+S: yellow pane hold, no tab badge; Alt+A erases hold"
+                    )
                 child.send("\x1ba")
                 deadline = time.monotonic() + 1
                 while time.monotonic() < deadline:
@@ -234,11 +257,12 @@ def main() -> None:
                     )
                 )
                 expected_prefix = "" if event == "Stop" else prefix
+                expected_tab_prefix = "" if event in ("Stop", "SessionStart") else prefix
                 actual = next(
                     p for p in after if not p["is_plugin"] and p["id"] == pane_id
                 )
                 assert actual["title"] == expected_prefix + "Badge pane", actual
-                assert actual["tab_name"] == expected_prefix + "Badge tab", actual
+                assert actual["tab_name"] == expected_tab_prefix + "Badge tab", actual
                 assert actual["is_focused"] and not actual["is_suppressed"], actual
                 assert len(after) == len(panes), after
                 rich.get_console().print(
@@ -349,7 +373,7 @@ def main() -> None:
                 )
             )
             terminals = {p["id"]: p for p in after if not p["is_plugin"]}
-            assert terminals[pane_id]["title"] == "Badge pane", terminals
+            assert terminals[pane_id]["title"] == "[⚪ ○] Badge pane", terminals
             assert terminals[second_id]["title"] == "[🟠 ↻] Second pane", terminals
             assert all(
                 p["tab_name"] == "[🟠 ↻] Badge tab" for p in terminals.values()

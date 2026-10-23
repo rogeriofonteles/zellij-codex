@@ -18,6 +18,11 @@ keybinds {
                 name "zellij_codex_clear_done"
             }
         }
+        bind "Alt s" {
+            MessagePlugin {
+                name "zellij_codex_toggle_hold"
+            }
+        }
         bind "Ctrl Tab" { GoToNextTab; }
         bind "Ctrl Shift Tab" { GoToPreviousTab; }
     }

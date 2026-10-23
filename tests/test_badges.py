@@ -6,6 +6,8 @@ BADGES = runpy.run_path(str(Path(__file__).parents[1] / "scripts/codex-badges"))
 
 
 def test_lifecycle_preserves_names_and_does_not_duplicate_badges() -> None:
+    for title in ("[🟡 Ⅱ] Existing", "[🟡 Ⅱ ] Existing", "[🟡⏸︎] Existing", "[🟡⏸] Existing", "[🟡‖] Existing"):
+        assert BADGES["badge_title"](title, "hold") == "[🟡 ⚑] Existing"
     assert BADGES["badge_title"]("[🔴 ↻] Existing", "running") == "[🟠 ↻] Existing"
     assert BADGES["badge_title"]("[🟡 !] Existing", "input") == "[🔴 !] Existing"
     state: dict[str, Any] = {}
@@ -145,6 +147,62 @@ def test_done_wins_until_prompt_or_acknowledgement_then_running_resumes() -> Non
             ],
             ["rename-tab-by-id", "12", "--", "[🟠 ↻] feature"],
         ]
+
+
+
+def test_hold_hides_done_from_tab_and_acknowledgement_removes_pane_badge() -> None:
+    panes = [_pane(7, 12), _pane(8, 12)]
+    panes[0].update(title="[🔵 ✓] My agent", tab_name="[🔵 ✓] feature")
+    panes[1]["tab_name"] = "[🔵 ✓] feature"
+    state, actions = BADGES["reconcile"](
+        {"statuses": {"7": "done"}}, panes, {"toggle_hold_pane_id": 7}
+    )
+    assert state["on_hold"] == ["7"]
+    assert actions == [
+        ["rename-pane", "--pane-id", "terminal_7", "--", "[🟡 ⚑] My agent"],
+        ["rename-tab-by-id", "12", "--", "feature"],
+    ]
+    panes[0].update(title="[🟡 ⚑] My agent", tab_name="feature")
+    panes[1]["tab_name"] = "feature"
+    for status in ("running", "done", "input"):
+        updated, actions = BADGES["reconcile"](
+            state, panes, {"pane_id": 8, "status": status}
+        )
+        assert ["rename-tab-by-id", "12", "--", BADGES["BADGES"][status] + "feature"] in actions
+        assert updated["on_hold"] == ["7"]
+    updated, actions = BADGES["reconcile"](state, panes, {"toggle_hold_pane_id": 7})
+    assert "on_hold" not in updated
+    assert ["rename-tab-by-id", "12", "--", "[🔵 ✓] feature"] in actions
+    updated, actions = BADGES["reconcile"](state, panes, {"clear_done_pane_id": 7})
+    assert "on_hold" not in updated
+    assert updated["statuses"] == {}
+    assert actions == [["rename-pane", "--pane-id", "terminal_7", "--", "My agent"]]
+
+
+def test_hold_survives_updates_and_clears_on_new_work_or_pane_removal() -> None:
+    panes = [_pane(7, 12)]
+    state, _ = BADGES["reconcile"](
+        {"statuses": {"7": "input"}}, panes, {"toggle_hold_pane_id": 7}
+    )
+    panes[0]["title"] = "[🟡 ⚑] My agent"
+    for event, status in (("PostToolUse", "running"), ("Stop", "done")):
+        state, actions = BADGES["reconcile"](
+            state, panes, {"pane_id": 7, "status": status, "event": event}
+        )
+        assert state["on_hold"] == ["7"]
+        assert actions == []
+    for report in (
+        {"pane_id": 7, "status": "running", "event": "UserPromptSubmit"},
+        {"pane_id": 7, "status": "idle", "event": "SessionStart"},
+        {"pane_id": 7, "status": "idle", "binding_prefix": "new-thread"},
+        {"pane_id": 7, "remove": True},
+    ):
+        updated, _ = BADGES["reconcile"](state, panes, report)
+        assert "on_hold" not in updated
+    updated, _ = BADGES["reconcile"](state, [], {})
+    assert updated["statuses"] == {} and "on_hold" not in updated
+    updated, actions = BADGES["reconcile"]({}, panes, {"toggle_hold_pane_id": 7})
+    assert updated["statuses"] == {} and "on_hold" not in updated
 
 
 def _pane(pane_id: int, tab_id: int) -> dict[str, Any]:

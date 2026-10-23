@@ -14,8 +14,8 @@ panel, or both. Installing a WASM file does not start it.
 | [Status panel](#optional-status-panel-legacy-dashboard) | Build/copy `zellij-codex.wasm`, then explicitly launch it | A resident Zellij monitor discovers panes and reads pane content, including while the panel is hidden | [Stop the panel and its monitor](#stop-the-panel-and-its-monitor) |
 
 The full setup below enables badges and reserves **Alt+A for clearing the
-selected pane's done badge**. It does not start the status panel or a remote
-receiver. The optional panel shortcut below is **Ctrl+Alt+D**.
+selected pane's done or hold badge**, plus **Alt+S for toggling a pane-only yellow
+hold marker**. It does not start the status panel or a remote receiver. The optional panel shortcut below is **Ctrl+Alt+D**.
 
 The panel is the legacy dashboard: it has its own colors and acknowledges done
 results when the corresponding pane is viewed. It does not share the badge
@@ -167,6 +167,7 @@ The custom tab bar adds pane-specific Alt+A acknowledgment.
 | Running | `[🟠 ↻]` |
 | Waiting for input or approval | `[🔴 !]` |
 | Done | `[🔵 ✓]` |
+| On hold (Alt+S) | `[🟡 ⚑]` on the selected pane only; no tab badge |
 
 Badges appear beside the existing tab and pane names. The custom tab bar retains
 Zellij's native theme colors and displays the same Unicode emoji markers as pane
@@ -178,6 +179,13 @@ done badge until the last completed pane is cleared; running/input badges remain
 One done pane plus one running pane shows done. A new prompt immediately marks
 its pane running; if no done panes remain, the tab shows running. Clearing the
 last done pane with Alt+A also reveals another pane's running status.
+Alt+S toggles a yellow hold marker on the selected tracked pane. Its status no
+longer contributes to the tab badge: a held done pane leaves the tab undecorated
+unless another pane contributes a badge. Background lifecycle updates preserve
+the hold marker. Alt+S again restores the latest status; Alt+A removes the hold
+badge entirely without restoring done. A new prompt, session start, or conversation
+clears hold automatically. This marker does not pause Codex execution.
+
 Done also clears on the next
 prompt, session start, or session end. Plain-text questions without an input-tool event
 appear as done when the turn ends.
@@ -219,14 +227,20 @@ keybinds {
                 name "zellij_codex_clear_done"
             }
         }
+        bind "Alt s" {
+            MessagePlugin {
+                name "zellij_codex_toggle_hold"
+            }
+        }
     }
 }
 ```
 
 The tab bar runs the installed helper without opening a pane or changing focus.
-Grant its RunCommands permission when prompted. Only the selected pane’s completed badge is cleared; the tab badge is
+Grant its RunCommands permission when prompted. Only the selected pane’s completed or hold badge is cleared; the tab badge is
 recomputed from all remaining pane statuses. From a shell, `zellij-codex-badges --clear-done` performs
 the same action without requiring the custom tab bar.
+`zellij-codex-badges --toggle-hold` toggles hold from a shell.
 
 Manual report from a Zellij pane:
 

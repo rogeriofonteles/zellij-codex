@@ -109,7 +109,7 @@ impl ZellijPlugin for State {
             Event::RunCommandResult(code, _, stderr, _) => {
                 if code != Some(0) {
                     eprintln!(
-                        "Could not clear completed badges: {}",
+                        "Could not update badges: {}",
                         String::from_utf8_lossy(&stderr)
                     );
                 }
@@ -174,7 +174,12 @@ impl ZellijPlugin for State {
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
-        if message.name != "zellij_codex_clear_done" || !self.permissions_granted {
+        let action = match message.name.as_str() {
+            "zellij_codex_clear_done" => "--clear-done",
+            "zellij_codex_toggle_hold" => "--toggle-hold",
+            _ => return false,
+        };
+        if !self.permissions_granted {
             return false;
         }
         // Broadcast keybindings reach every tab bar; only the current tab handles this one.
@@ -203,7 +208,7 @@ impl ZellijPlugin for State {
                 "zellij-codex-clear-done",
             ],
         };
-        command.extend(["--session", session, "--clear-done", "--pane-id", &pane_id]);
+        command.extend(["--session", session, action, "--pane-id", &pane_id]);
         run_command(&command, BTreeMap::new());
         false
     }

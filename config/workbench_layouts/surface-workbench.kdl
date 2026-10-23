@@ -4,9 +4,9 @@ layout {
             plugin location=__TAB_BAR_PLUGIN__
         }
         pane split_direction="vertical" {
-            pane size="50%" focus=true name="Git / Shell"
-            pane size="50%" command="env" {
-                args __ZELLIJ_SOCKET_ENV_ARG__ "bash" "-lc" "unset NO_COLOR; if [[ ${TERM:-} == screen ]] && infocmp screen-256color >/dev/null 2>&1; then export TERM=screen-256color; fi; export COLORTERM=${COLORTERM:-truecolor}; if command -v zellij-codex-launch >/dev/null 2>&1; then exec zellij-codex-launch --yolo; else exec codex --yolo; fi"
+            pane size="33%" focus=true name=__WORKBENCH_PANE_NAME__
+            pane size="67%" command="env" {
+                args __ZELLIJ_SOCKET_ENV_ARG__ "fish" "-lc" "set -e NO_COLOR; if test \"$TERM\" = screen; and infocmp screen-256color >/dev/null 2>&1; set -gx TERM screen-256color; end; if not set -q COLORTERM; set -gx COLORTERM truecolor; end; codex-yolo"
             }
         }
         pane size=1 borderless=true {
